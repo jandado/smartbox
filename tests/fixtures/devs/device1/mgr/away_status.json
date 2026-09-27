@@ -1,1 +1,5 @@
-{ "enabled": 1, "away": 0, "forced": 1 }
+{
+    "away": 0,
+    "enabled": 1,
+    "forced": 1
+}
