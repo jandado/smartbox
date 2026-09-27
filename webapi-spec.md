@@ -1,0 +1,174 @@
+# Web API spec — as used by the vendor app (Helki platform)
+
+**Provenance:** statically extracted from the official Android app
+`com.technotherm.lhzapp` v1.420.1 (APK sha256 `43df21cf…d4df1`),
+`assets/www/app.js` — the Cordova packaging of the same "Helki" Vue SPA that
+powers `app.smart-control.eu` (plus native BLE/ESP-Touch provisioning
+bridges). Cross-checked against live wire probes in `api-notes.md`
+("Observed behaviour") and against this library's `session.py` surface.
+
+**Status markers:** ✔ = matches library/integration behaviour;
+⚠ = discrepancy or unverified-on-our-hardware item (each has an entry in
+§Discrepancies). Everything here is cloud-API (`https://api-<reseller>.helki.com`);
+the local-LAN API of the box is documented at the end (§Local API, informational).
+
+---
+
+## 1. Auth ✔
+
+- `POST /client/token`, headers `Authorization: Basic <client_basic_auth>`,
+  `Content-Type: application/x-www-form-urlencoded`, body form-encoded:
+  - sign-in: `grant_type=password`, `username`, `password`
+  - refresh: `grant_type=refresh_token`, `refresh_token`
+- Response: `{access_token, refresh_token, expires_in}` → all later calls
+  `Authorization: Bearer <access_token>`.
+- Brand headers on every call: `x-serialid: <reseller serial id>`, and
+  `x-referer: <scheme+host of frontend>` where set (matches
+  `smartbox/reseller.py`). Library implementation ✔ identical.
+
+## 2. Device / home level
+
+| Method & path | Body / notes |
+|---|---|
+| `GET /api/v2/devs` | device list (incl. `invited_to`) ✔ |
+| `GET /api/v2/grouped_devs` | homes/groups ✔ |
+| `GET /api/v2/devs/<dev_id>/connected` → `{connected}` ✔ |
+| `GET /api/v2/devs/<dev_id>/mgr/nodes` ✔ |
+| `GET /api/v2/devs/<dev_id>/dev_data` | full device+nodes snapshot |
+| `POST /api/v2/devs/<dev_id>/name` | `{name}` — ✔ implemented in 2.6.0 (unverified live) |
+| `POST /api/v2/devs/<dev_id>/group` | group move — ✔ implemented in 2.6.0, body pass-through (unverified live) |
+| `DELETE /api/v2/devs/<dev_id>` | remove device — ✔ implemented in 2.6.0 (destructive; unverified live) |
+| `GET/POST /api/v2/devs/<dev_id>/mgr/away_status` | **✔ payload verified live (2026-09-27)**: app sends `{away: bool, enabled: bool}` (enabled defaults true in app code); server honours both `{away, enabled}` and `{away}` alone — library defaults `enabled: true` since 2.6.0 |
+| `GET /api/v2/devs/<dev_id>/mgr/discovery` → `{discovery: 'on'|'off'}` ✔ (verified live) |
+| `POST /api/v2/devs/<dev_id>/mgr/discovery` | `{discovery: 'on'|'off', type?, addr?, limit?}` — ✔ implemented in 2.6.0 (unverified live) |
+| `GET /api/v2/devs/<dev_id>/mgr/rtc/time` | device clock — ✔ implemented in 2.6.0 (unverified live) |
+| `GET/POST /api/v2/devs/<dev_id>/htr_system/power_limit` | `{power_limit: "<int as string>"}` ✔ (library sends `str(int)` ✔) |
+| `POST /api/v2/devs/<dev_id>/pmo_system` | PMO-only, out of scope |
+| `GET /api/v2/groups/<home_id>/geo_data`, `.../name` `{name}`, `.../extra_data` |
+| `GET /api/v2/groups/<home_id>/guest_users`, invites (`/users/<uid>/invite` POST/DELETE, `/invite_confirmation`) |
+| `GET /api/notifications/v1/<group_id>/presence/config` (+`/test`) | "quiet home" notifications — ✔ implemented in 2.6.0: config GET/POST + test POST (paths confirmed in the app bundle; unverified live) |
+| `GET /api/v2/encrypted_wifi_credentials?ssid=&pass=` → `{encrypted_pass}` | provisioning only; AES-256-CBC PBE under hardcoded key `5786647123672357` (salt=IV=ASCII bytes, 10 000 iters, `PBEWITHSHA256AND256BITAES-CBC-BC`) — see research notes |
+| `GET /api/location/v1/coordinates?country=&state=&city=&zip=` | geocoding helper |
+
+## 3. Node level (`<type>` ∈ htr, htr_mod, thm, acm, pmo; `<addr>` int)
+
+| Method & path | Body / notes |
+|---|---|
+| `GET /api/v2/devs/<dev_id>/<type>/<addr>` | full node data ✔ (library uses per-section GETs instead — equivalent) |
+| `GET .../status` ✔ | |
+| `POST .../status` | **write semantics — see §4** ✔ shape-compatible |
+| `GET .../setup` ✔ | |
+| `POST .../setup` | **full merged setup object** — library already merges before POST ✔ (session.py `set_node_setup`) |
+| `GET .../version` ✔ | |
+| `GET .../prog` | **schedule read** — returns `{prog: {…}}`; per the app, `prog.prog` = 7 day-arrays of ints (profile indices) — ✔ captured live (fixtures `tests/fixtures/live/htr_prog_addr{2..6}.json`): string day keys `"0".."6"`, 24 hourly slots at prog_resolution 0 |
+| `POST .../prog` | **schedule write** — body `{prog: …}` — ✔ implemented in 2.6.0 (`set_node_prog`); day-keyed object shape; the JSON-array shape is rejected with 400 (observed live) |
+| `POST .../prog_temps` | dedicated prog-temperature endpoint (in `APIManager`; app's manager actually uses `POST .../status` with `{ice_temp, eco_temp, comf_temp, units}` — see §4; no caller found for plain htr) |
+| `POST .../mode` | dedicated mode endpoint (in `APIManager`; node managers use `POST .../status {mode…}` — see §4) |
+| `POST .../lock` | dedicated lock endpoint (managers use `POST .../status {locked}` ✔) |
+| `POST .../boost` | boost config `{active, temperature, units, time}` — boost-capable products only; **our 5× htr are factory boost-disabled (N/A)** |
+| `POST .../power_limit` | `{power_limit: "<int>"}` (node-level, PMO) |
+| `POST .../name` `{name}` / `POST .../select` `{select}` / `GET .../power` / `DELETE .../<type>/<addr>` (`{purge}`) | fleet-management ops — ✔ implemented in 2.6.0 (unverified live) |
+| `GET .../samples?start=<unix>&end=<unix>` ✔ | app additionally uses classified/E2/hi-res variants and generation/surplus sample kinds (PMO/PV context) |
+
+## 4. Status write semantics (as exercised by the app)
+
+App-side node managers build these bodies (all to `POST .../status`):
+
+1. Setpoint: `{stemp: "20.0", units: "C"}` — ✔ identical to integration.
+2. Setpoint in auto: same body; app *optionally* adds `"mode": "modified_auto"`
+   (auto→temp-bump mapping) gated on capability
+   `INDEPENDENT_TEMP_AND_MODE_ON_UPDATE`; live probe (api-notes) shows fw 1.9
+   does **not** flip mode on the wire when only `{stemp, units}` is sent.
+3. Mode change: `{mode: "manual"|"auto"|"off"|…}`; when the capability above
+   is absent, MANUAL carries the temp too: `{mode, stemp, units}` (3-key!).
+4. Profile temps: `{ice_temp, eco_temp, comf_temp, units}` (4-key, all
+   temperature-category).
+5. Lock: `{locked: bool}` ✔ single-key.
+
+**Refined one-key rule (supersedes the absolute pin in api-notes):**
+multi-key status POSTs are accepted **within a category** (temp-keys+units,
+mode+stemp+units) — the app does this in production. The observed silent
+drop happened on a **4-key mixed-category** body
+(`{locked, stemp, units, mode}`). Integration's sequential single-key posts
+remain the safe pattern; do not change without a live A/B probe.
+
+Mode-change sequencing: before switching away from `boost`/`runback`, the app
+first POSTs the deactivate for the previous mode, then activates the new one
+(`deactivatePreviousMode()` → `activateMode()`). Not applicable to plain htr
+without those modes active.
+
+`modified_auto`: exists as an app-level mode value; on fw 1.9 the device does
+not reflect it on the wire when not explicitly sent. Unverified whether
+sending `mode:"modified_auto"` explicitly changes device behaviour — treat as
+open item; integration need not use it.
+
+
+## 5. Schedule model (the scheduling feature's core)
+
+- `prog.prog` = **7 day-arrays** (Mon..Sun), each holding **N profile-index
+  ints**, one per slot: 24 slots @ 60 min (hourly, `prog_resolution: 0`), or
+  48 @ 30 min when capability `MULTIPLE_SCHEDULE_RESOLUTIONS` is active
+  (`prog_resolution: 1`).
+- Profile index order (plain htr): **0=ICE, 1=ECO, 2=COMFORT**
+  (`getIndexSortedScheduleProfiles()`); UI profile id → API index via
+  `getApiScheduleProfile()` = index in that list (unknown → 0).
+- UI schedule = per day, slots `{start, end, id}` in **minutes from midnight**,
+  `id` = profile. Conversion to raw: expand each slot into
+  `ceil((end-start)/slotMinutes)` repeated indices; pad the day to 24 h.
+  Reconstruction (raw → UI): collapse runs of equal indices; last slot ends
+  1440.
+- Resolution change: `setScheduleMethod(method)` → **setup POST
+  `{prog_resol: m, prog_resolution: m}`** (2-key setup write; the app merges
+  into the full setup first — merge rules as §3/setup).
+- Temperature edit per profile: app clamps against neighbour profiles
+  (`scheduleTemperatureOffset`) then sends the 4-key status post (§4.4).
+  Simpler equivalent: single-key posts per temp key + units — **verify one
+  variant live before relying on it**.
+- Websocket: schedule changes arrive as `/htr/<addr>/prog` update frames
+  (observed live, api-notes) — the integration's websocket handler must
+  store `prog` frames like `status` frames (verify current handling during
+  implementation).
+
+## 6. Discrepancies & open items (app vs library vs integration)
+
+| # | Item | Severity | Action |
+|---|---|---|---|
+| D1 | Away write: app `{away, enabled}`; integration `{away}` only | **CLOSED (2026-09-27, live)**: server honours both shapes — `enabled` tolerated, not required; library defaults it like the app since 2.6.0 |
+| D2 | `POST/GET .../prog` absent from library | **CLOSED (2.6.0)**: `get_node_prog`/`set_node_prog` in `session.py` (+ sync `Session`, `NodeProg`, websocket helper, CLI) |
+| D3 | Multi-key status semantics: pin refined (category-scoped, not absolute) | **CLOSED (2026-09-27)**: api-notes rewritten to the category-scoped rule |
+| D4 | Dedicated `/mode`, `/lock`, `/boost`, `/prog_temps` endpoints unused by library | **CLOSED (2.6.0)**: implemented to spec; boost marked **unverified-on-hardware** (factory boost-disabled units) |
+| D5 | `prog_resolution` / `MULTIPLE_SCHEDULE_RESOLUTIONS` on fw-1.9 htr unverified | **PARTIALLY CLOSED (2026-09-27, live)**: this family's `factory_options` has **no `prog_resolution` key** — resolution not readable from setup; observed schedule is 24 hourly slots. 48-slot mode unverified (no capable hardware) |
+| D6 | No live `GET .../prog` sample exists | **CLOSED (2026-09-27)**: captured from heater 5 + all nodes; fixture + pins in `tests/fixtures/live/` |
+| D7 | Local-LAN API (HelkiDigest) — no vendor client exists; dead end by design | CLOSED | see `~/git/ha-smartbox-integration/research/findings.md` |
+
+## 7. Suggested implementation order (lib-first, per program.md)
+
+1. Live read-round: `GET devs/<id>/htr/5/prog` + node `setup` (capture
+   `prog_resolution`, capability signals) → fixture
+   `tests/fixtures/live/htr_prog.json`.
+2. Library: `get_node_prog()`, `set_node_prog(prog)` (body `{prog: …}`),
+   optional `set_prog_temps()`; models `NodeProg`; version bump; contract
+   tests (`../hass-smartbox/tests/test_lib_contract.py`).
+3. Integration: schedule entities/services on top (design decision there:
+   per-day `select` entities are clunky — prefer services
+   `smartbox.set_schedule` / `smartbox.set_profile_temps` + a climate
+   attribute exposing the parsed week schedule).
+4. Verification: round-trip edit on heater 5 (snapshot → edit → verify →
+   restore), websocket `prog` frame handling, key-count rules respected.
+
+---
+
+## Appendix — Local API of the box (informational, CLOSED)
+
+`http://<box>:80`: `GET /info` open (devid, timezone); everything else 401 +
+`WWW-Authenticate: HelkiDigest <16 printable-ASCII bytes, hex-encoded>`;
+response token = 32 chars, length-validated only; nonce reusable;
+wrong-but-well-formed → 401 + fresh nonce; malformed → 400. Routes exist
+behind auth (`/mgr/nodes`, `/dev_data`, `/htr/N/*`, `/mgr/cloud`,
+`/mgr/status`, `/mgr/away_status`, `/mgr/rtc/time`, `/mgr/discovery`, …) —
+mirroring the cloud API. `/mgr/wifi/scan|network|start` exist only in SoftAP
+provisioning mode (open, no auth; body `{essid, pass|encrypted_pass}`).
+No vendor client implements the digest (web SPA, APK dex and JS all lack it)
+— the box is cloud-tethered; local control would require impersonating the
+provider endpoint. Investigation closed 2026-09-26; full log:
+`~/git/ha-smartbox-integration/research/findings.md`.

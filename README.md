@@ -75,6 +75,18 @@ node.
 
     smartbox <auth options...> set-setup <-d/--device-id> <device id> <-n/--node-addr> <node> <name>=<value> [<name>=<value> ...]
 
+### Getting node programme
+The `prog` command lists the weekly schedule across all nodes and devices.
+
+    smartbox <auth options...> prog
+
+### Setting node programme
+The `set-prog` command can be used to set the weekly schedule (programme)
+of a particular node from a JSON string. The schedule is day-level-merged
+onto the node's current schedule before posting:
+
+    smartbox <auth options...> set-prog <-d/--device-id> <device id> <-n/--node-addr> <node> '{"prog": {"0": [0, 2, 2, ...], ...}}'
+
 ### Setting node samples
 
 The `node-samples` command can be used to get the historical data (temperature and consumption) of a node.
