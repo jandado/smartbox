@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -226,6 +227,55 @@ def test_update_manager_subscribe_to_device_connected(update_manager):
     callback.assert_called_once_with(update_data["body"]["connected"])
 
 
+def test_dev_data_subscription_isolates_callback_exceptions():
+    """A raising callback must not starve the other subscriptions."""
+
+    def bad(_data):
+        msg = "boom"
+        raise RuntimeError(msg)
+
+    ok = MagicMock()
+    DevDataSubscription(".data", bad).match({"data": "value"})
+    DevDataSubscription(".data", ok).match({"data": "value"})
+    ok.assert_called_once_with("value")
+
+
+def test_update_subscription_isolates_callback_exceptions():
+    """A raising update callback must not starve the other subscriptions."""
+    calls = []
+
+    def bad(data, **kwargs):
+        msg = "boom"
+        raise RuntimeError(msg)
+
+    UpdateSubscription(r"^/path", ".data", bad).match(
+        {"path": "/path", "data": "value"},
+    )
+    UpdateSubscription(
+        r"^/path",
+        ".data",
+        lambda d, **_k: calls.append(d),
+    ).match({"path": "/path", "data": "value"})
+    assert calls == ["value"]
+
+
+def test_update_subscription_missing_path_is_safe():
+    """A missing ``path`` key must not raise KeyError when matched."""
+    callback = MagicMock()
+    assert not UpdateSubscription(r"^/path", ".data", callback).match({})
+    callback.assert_not_called()
+
+
+def test_update_manager_node_status_wrapper_skips_null_status(update_manager):
+    """Jq emits status: null for key-less nodes — callback must not fire."""
+    callback = MagicMock()
+    update_manager.subscribe_to_node_status(callback)
+    update_manager._dev_data_cb(
+        {"nodes": [{"type": "htr", "addr": 1, "status": None}]},
+    )
+    callback.assert_not_called()
+
+
 def test_update_manager_subscribe_to_node_version(update_manager):
     callback = MagicMock()
     update_manager.subscribe_to_node_version(callback)
@@ -281,3 +331,49 @@ def test_update_manager_subscribe_to_node_version(update_manager):
             "uid": "test123",
         },
     )
+
+
+def test_update_manager_subscribe_to_node_prog(update_manager):
+    callback = MagicMock()
+    update_manager.subscribe_to_node_prog(callback)
+    assert len(update_manager._dev_data_subscriptions) == 1
+    assert len(update_manager._update_subscriptions) == 1
+
+    # Test dev data callback
+    day_prog = [0] * 24
+    dev_data = {
+        "nodes": [
+            {"type": "htr", "addr": 5, "prog": {"0": day_prog}},
+        ],
+    }
+    update_manager._dev_data_cb(dev_data)
+    callback.assert_called_once_with("htr", 5, {"0": day_prog})
+
+    # Test update callback
+    callback.reset_mock()
+    update_data = {
+        "path": "/htr/5/prog",
+        "body": {"0": day_prog},
+    }
+    update_manager._update_cb(update_data)
+    callback.assert_called_once_with("htr", 5, {"0": day_prog})
+
+
+def test_node_prog_subscription_ignores_prog_temps_path(update_manager):
+    """Regression: unanchored ``/prog`` also matched ``/prog_temps``."""
+    callback = MagicMock()
+    update_manager.subscribe_to_node_prog(callback)
+    update_manager._update_cb(
+        {"path": "/htr/5/prog_temps", "body": {"comf_temp": "20.0"}},
+    )
+    callback.assert_not_called()
+
+
+def test_update_cb_path_error_logged_once(update_manager, caplog):
+    """A malformed update is logged once, not once per subscription."""
+    for _ in range(3):
+        update_manager.subscribe_to_updates(r"^/x", ".body", MagicMock())
+    with caplog.at_level(logging.ERROR, logger="smartbox.update_manager"):
+        update_manager._update_cb({"no": "path"})
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1

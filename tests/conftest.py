@@ -69,7 +69,14 @@ def async_session(reseller, mocker):
 
     class MockAiohttpResponse:
         def __init__(self, *args, **kwargs):
-            self.url = args[0] if args else kwargs.get("url", "")
+            # Works for get(url), post(url=...) and request(method, url)
+            self.url = (
+                args[1]
+                if len(args) > 1
+                else args[0]
+                if args
+                else kwargs.get("url", "")
+            )
 
         async def __aenter__(self):
             return self
@@ -97,6 +104,7 @@ def async_session(reseller, mocker):
     mock_client = mocker.MagicMock()
     mock_client.get.side_effect = MockAiohttpResponse
     mock_client.post.side_effect = MockAiohttpResponse
+    mock_client.request.side_effect = MockAiohttpResponse
 
     with patch(
         "smartbox.session.AsyncSession.client",

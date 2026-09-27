@@ -1,6 +1,7 @@
 from smartbox.models import (
     AcmNodeStatus,
     DefaultNodeStatus,
+    Devices,
     Guests,
     GuestUser,
     HtrModNodeStatus,
@@ -281,3 +282,10 @@ def test_guests():
     assert len(guests.guest_users) == 2
     assert guests.guest_users[0].email == "guest1@example.com"
     assert not guests.guest_users[1].pending
+
+
+def test_devices_invited_to_default():
+    """invited_to may be omitted by the server without breaking validation."""
+    devices = Devices.model_validate({"devs": []})
+    assert devices.devs == []
+    assert devices.invited_to == []

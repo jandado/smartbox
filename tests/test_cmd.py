@@ -270,7 +270,7 @@ async def test_reseller(runner, mocker, reseller):
     )
     assert result.exit_code == 0
     assert "test_api" in result.output
-    assert "http" in result.output
+    assert "api_url: test_api" in result.output
 
 
 @pytest.mark.asyncio
@@ -383,3 +383,84 @@ async def test_device_connected_status(runner, async_smartbox_session):
     )
     assert result.exit_code == 0
     assert "connected" in result.output
+
+
+@pytest.mark.asyncio
+async def test_api_name_defaults_to_api(runner, mock_session):
+    """Omitting -a constructs the session with the library default 'api'."""
+    result = await runner.invoke(
+        smartbox,
+        ["-u", "user", "-p", "pass", "resellers"],
+    )
+    assert result.exit_code == 0
+    assert mock_session.call_args.kwargs["api_name"] == "api"
+
+
+@pytest.mark.asyncio
+async def test_unknown_api_name_is_clean_error(runner):
+    """An unknown reseller produces a clean error, not a traceback."""
+    result = await runner.invoke(
+        smartbox,
+        ["-a", "unknown_api", "-u", "user", "-p", "pass", "resellers"],
+    )
+    assert result.exit_code == 1
+    assert "not yet available" in result.output
+
+
+@pytest.mark.asyncio
+async def test_set_prog_rejects_array_payload(runner, mock_session):
+    """Array-shape prog JSON is a clean CLI error, not a traceback."""
+    devices_future = asyncio.Future()
+    devices_future.set_result([{"name": "Device1", "dev_id": "1"}])
+    mock_session.return_value.get_devices.return_value = devices_future
+    nodes_future = asyncio.Future()
+    nodes_future.set_result([{"name": "Node1", "addr": 1}])
+    mock_session.return_value.get_nodes.return_value = nodes_future
+
+    result = await runner.invoke(
+        smartbox,
+        [*DEFAULT_ARGS, "set-prog", "-d", "1", "-n", "1", "[1, 2, 3]"],
+    )
+    assert result.exit_code != 0
+    assert "must be a JSON object" in result.output
+
+
+@pytest.mark.asyncio
+async def test_set_status_stemp_without_units_is_clean_error(
+    runner,
+    mock_session,
+):
+    """Regression: missing --units raised a raw ValueError traceback."""
+    devices_future = asyncio.Future()
+    devices_future.set_result([{"name": "Device1", "dev_id": "1"}])
+    mock_session.return_value.get_devices.return_value = devices_future
+    nodes_future = asyncio.Future()
+    nodes_future.set_result([{"name": "Node1", "addr": 1}])
+    mock_session.return_value.get_nodes.return_value = nodes_future
+
+    result = await runner.invoke(
+        smartbox,
+        [*DEFAULT_ARGS, "set-status", "-d", "1", "-n", "1", "--stemp", "20.0"],
+    )
+    assert result.exit_code != 0
+    assert "units" in result.output
+    mock_session.return_value.set_node_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_malformed_node_addr_is_clean_error(runner, mock_session):
+    """Regression: a non-numeric wire addr raised a raw ValueError traceback."""
+    devices_future = asyncio.Future()
+    devices_future.set_result([{"name": "Device1", "dev_id": "1"}])
+    mock_session.return_value.get_devices.return_value = devices_future
+    nodes_future = asyncio.Future()
+    nodes_future.set_result([{"name": "Node1", "addr": "one"}])
+    mock_session.return_value.get_nodes.return_value = nodes_future
+
+    result = await runner.invoke(
+        smartbox,
+        [*DEFAULT_ARGS, "set-status", "-d", "1", "-n", "1", "--mode", "auto"],
+    )
+    assert result.exit_code != 0
+    assert "malformed node payload" in result.output
+    mock_session.return_value.set_node_status.assert_not_called()

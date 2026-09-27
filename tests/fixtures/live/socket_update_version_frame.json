@@ -1,0 +1,9 @@
+{
+    "body": {
+        "fw_version": "1.9",
+        "hw_version": "1.1",
+        "pid": "0402",
+        "uid": "00REDACTED0000000000"
+    },
+    "path": "/htr/5/version"
+}
