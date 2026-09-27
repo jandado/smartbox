@@ -1,6 +1,6 @@
 [project]
 name = "smartbox"
-version = "2.5.2"
+version = "2.6.0"
 requires-python = ">=3.14.2"
 authors = [
   { name="Alberto Tudela", email="ajtudela@gmail.com" },
@@ -23,8 +23,6 @@ dependencies = [
     "jq",
     "pydantic",
     "python-socketio",
-    "requests",
-    "websocket-client",
 ]
 
 [project.urls]
@@ -38,8 +36,6 @@ smartbox = "smartbox.cmd:smartbox"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.uv.workspace]
-members = ["smartbox"]
 
 [dependency-groups]
 dev = [
@@ -66,9 +62,7 @@ warn_unused_configs = true
 
 [[tool.mypy.overrides]]
 module = [
-    "freezegun",
     "jq",
-    "test",
     "socketio",
     "asyncio",
 ]
@@ -76,9 +70,10 @@ ignore_missing_imports = true
 disable_error_code = ["arg-type"]
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py314"
 fix = true
 line-length = 80
+extend-exclude = ["tools"]
 
 [tool.ruff.lint]
 select = ["ALL"]
@@ -90,6 +85,15 @@ ignore = [
     "FBT001",
     "FBT002",
     "PLR0913",
+    "PLR0917", # positional-arg variant of PLR0913 (constructors take many args)
+    "CPY001", # no copyright headers in this project (MIT, upstream style)
+    # TC family: signature annotations are runtime API surface here — the
+    # HA integration's contract tests introspect them (PEP 649 lazy
+    # evaluation resolves names at access time), so typing-only imports
+    # must stay runtime-available.
+    "TC001",
+    "TC002",
+    "TC003",
     "A005",
     "COM812"
 ]
@@ -129,13 +133,9 @@ max-complexity = 25
     "PLR2004",
     "B018",
 ]
-"src/smartbox/cmd.py" = ["T201","ANN001"]
+"src/smartbox/cmd.py" = ["T201", "ANN001"]
+"tools/*" = ["T201", "ANN401", "INP001", "PLR0911", "PLR0915", "S108", "ASYNC240"]
 
-[tool.setuptools.package-data]
-"pkgname" = ["py.typed"]
-
-[tool.setuptools.packages.find]
-where = ["src"]
 
 [tool.tox]
 env_list = ["3.14"]

@@ -1,6 +1,7 @@
 """Pydantic model of smartbox."""
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, RootModel
 
@@ -16,28 +17,39 @@ class SmartboxNodeType(StrEnum):
 
 
 class NodeFactoryOptions(BaseModel):
-    """NodeFactoryOptions model."""
+    """NodeFactoryOptions model.
+
+    Field presence is firmware-family-dependent: older families carry the
+    full set (see tests/fixtures/devs), the fw-1.9 htr family only the
+    first four plus operating_mode/power_factor/super_lock_available (see
+    tests/fixtures/live).
+    """
 
     temp_compensation_enabled: bool
     window_mode_available: bool
     true_radiant_available: bool
     duty_limit: int
-    boost_config: int
-    button_double_press: bool
-    prog_resolution: int
-    bbc_value: int
-    bbc_available: bool
-    lst_value: int
-    lst_available: bool
-    fil_pilote_available: bool
-    backlight_time: int
-    button_down_code: int
-    button_up_code: int
-    button_mode_code: int
-    button_prog_code: int
-    button_off_code: int
-    button_boost_code: int
-    splash_screen_type: int
+    # Older-family fields (absent on fw-1.9 htr units).
+    boost_config: int | None = None
+    button_double_press: bool | None = None
+    prog_resolution: int | None = None
+    bbc_value: int | None = None
+    bbc_available: bool | None = None
+    lst_value: int | None = None
+    lst_available: bool | None = None
+    fil_pilote_available: bool | None = None
+    backlight_time: int | None = None
+    button_down_code: int | None = None
+    button_up_code: int | None = None
+    button_mode_code: int | None = None
+    button_prog_code: int | None = None
+    button_off_code: int | None = None
+    button_boost_code: int | None = None
+    splash_screen_type: int | None = None
+    # fw-1.9-family additions.
+    operating_mode: int | None = None
+    power_factor: int | None = None
+    super_lock_available: bool | None = None
 
 
 class NodeExtraOptions(BaseModel):
@@ -56,7 +68,12 @@ class PmoSetup(BaseModel):
 
 
 class DefaultNodeSetup(BaseModel):
-    """NodeSetup model."""
+    """NodeSetup model.
+
+    ``user_duty_factor``/``flash_version``/``extra_options`` are absent on
+    the fw-1.9 htr family; ``max_stemp_limit``/``priority``/``revision``
+    only appear there.
+    """
 
     sync_status: str
     control_mode: int
@@ -68,10 +85,15 @@ class DefaultNodeSetup(BaseModel):
     modified_auto_span: int
     window_mode_enabled: bool
     true_radiant_enabled: bool
-    user_duty_factor: int
-    flash_version: str
     factory_options: NodeFactoryOptions
-    extra_options: NodeExtraOptions
+    # Older-family fields (absent on fw-1.9 htr units).
+    user_duty_factor: int | None = None
+    flash_version: str | None = None
+    extra_options: NodeExtraOptions | None = None
+    # fw-1.9-family additions.
+    max_stemp_limit: str | None = None
+    priority: str | None = None
+    revision: int | None = None
 
 
 class NodeSetup(RootModel[DefaultNodeSetup | PmoSetup]):
@@ -79,9 +101,22 @@ class NodeSetup(RootModel[DefaultNodeSetup | PmoSetup]):
 
     root: DefaultNodeSetup | PmoSetup
 
-    def __getattr__(self, name: str) -> DefaultNodeSetup | PmoSetup:
+    def __getattr__(self, name: str) -> Any:  # noqa: ANN401
         """Get the root model directly."""
         return getattr(self.root, name)
+
+
+class NodeProg(BaseModel):
+    """Node programme (weekly schedule).
+
+    ``prog`` maps day keys "0".."6" (Mon..Sun) to per-slot profile-index
+    ints: 24 hourly slots at ``prog_resolution`` 0, 48 half-hourly at 1.
+    Profile indices on plain htr: 0=ICE, 1=ECO, 2=COMF. The GET response
+    also carries ``sync_status``.
+    """
+
+    prog: dict[str, list[int]]
+    sync_status: str | None = None
 
 
 class NodeVersion(BaseModel):
@@ -101,13 +136,16 @@ class DefaultNodeStatus(BaseModel):
     sync_status: str
     locked: bool
     mode: str
-    error_code: str
+    # Firmware-dependent: newer units report an int code, older ones a
+    # string like "none" (observed families pinned in tests/fixtures/live).
+    error_code: str | int
 
     eco_temp: str
     comf_temp: str
-    act_duty: int
+    # Absent on newer htr firmware (fw 1.9 family); required on older ones.
+    act_duty: int | None = None
     pcb_temp: str
-    power_pcb_temp: str
+    power_pcb_temp: str | None = None
     presence: bool
     window_open: bool
     true_radiant_active: bool
@@ -128,26 +166,17 @@ class HtrModNodeStatus(DefaultNodeStatus):
     selected_temp: str
     comfort_temp: str
     eco_offset: str
-    ice_temp: str
-    active: bool
 
 
 class HtrNodeStatus(DefaultNodeStatus):
     """NodeStatus for HTR node."""
 
-    stemp: str
-    active: bool
-    power: str
-    duty: int
-
 
 class AcmNodeStatus(DefaultNodeStatus):
     """NodeStatus for acm node."""
 
-    stemp: str
     charging: bool
     charge_level: int
-    power: str
 
 
 class NodeStatus(
@@ -155,13 +184,19 @@ class NodeStatus(
         AcmNodeStatus | HtrNodeStatus | HtrModNodeStatus | DefaultNodeStatus
     ]
 ):
-    """NodeStatus model."""
+    """NodeStatus model.
+
+    Union resolution is pydantic smart-union: complete frames match their
+    specific class (verified: htr_mod payloads resolve to
+    HtrModNodeStatus). Note the degradation mode for *partial* frames:
+    a payload missing one of the htr_mod extras validates as
+    HtrNodeStatus and silently drops those extras, since HtrNodeStatus
+    accepts any DefaultNodeStatus-shaped payload.
+    """
 
     root: AcmNodeStatus | HtrNodeStatus | HtrModNodeStatus | DefaultNodeStatus
 
-    def __getattr__(
-        self, name: str
-    ) -> AcmNodeStatus | HtrNodeStatus | HtrModNodeStatus | DefaultNodeStatus:
+    def __getattr__(self, name: str) -> Any:  # noqa: ANN401
         """Get the root model directly."""
         return getattr(self.root, name)
 
@@ -204,7 +239,7 @@ class Devices(BaseModel):
     """Devices model."""
 
     devs: list[Device]
-    invited_to: list[Device]
+    invited_to: list[Device] = []
 
 
 class Home(BaseModel):
@@ -223,7 +258,7 @@ class Homes(RootModel[list[Home]]):
 
 
 class Sample(BaseModel):
-    """Pmo Sample model."""
+    """Sample model: temperature history (t, counter, temp)."""
 
     t: int
     counter: float
@@ -231,7 +266,7 @@ class Sample(BaseModel):
 
 
 class PmoSample(BaseModel):
-    """Default Sample."""
+    """PMO sample model: consumption history (t, counter, max, min)."""
 
     t: int
     counter: float

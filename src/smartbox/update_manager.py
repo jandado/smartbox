@@ -67,11 +67,24 @@ class DevDataSubscription:
         """Return matches for this subscription for the given dev data."""
         _LOGGER.debug("Matching jq %s", self._jq_matcher)
         try:
-            for match in self._jq_matcher.match(input_data):
-                if match is not None:
-                    self._callback(match)
+            # The ValueError guard covers jq evaluation only: exceptions
+            # from the user callback must not be misattributed to jq.
+            matches = list(self._jq_matcher.match(input_data))
         except ValueError:
             _LOGGER.exception("Error evaluating jq on dev data %s", input_data)
+            return
+        for match in matches:
+            if match is None:
+                continue
+            try:
+                # Isolate user callbacks: one raising callback must not
+                # starve the other subscriptions or kill the socket loop.
+                self._callback(match)
+            except Exception:
+                _LOGGER.exception(
+                    "Error in dev_data callback for %s",
+                    self._jq_matcher,
+                )
 
 
 class UpdateSubscription:
@@ -90,19 +103,34 @@ class UpdateSubscription:
 
     def match(self, input_data: dict[str, Any]) -> bool:
         """Return matches for this subscription for the given update."""
-        path_match = self._path_regex.search(input_data["path"])
+        path_match = self._path_regex.search(input_data.get("path", ""))
         if not path_match:
             return False
         path_match_kwargs = path_match.groupdict()
         matched = False
         _LOGGER.debug("Matching jq %s", self._jq_matcher)
         try:
-            for data_match in self._jq_matcher.match(input_data):
-                if data_match is not None:
-                    matched = True
-                    self._callback(data_match, **path_match_kwargs)
+            # The ValueError guard covers jq evaluation only: exceptions
+            # from the user callback must not be misattributed to jq.
+            data_matches = [
+                data_match
+                for data_match in self._jq_matcher.match(input_data)
+                if data_match is not None
+            ]
         except ValueError:
             _LOGGER.exception("Error evaluating jq on update %s", input_data)
+            return False
+        for data_match in data_matches:
+            matched = True
+            try:
+                # Isolate user callbacks: one raising callback must not
+                # starve the other subscriptions or kill the socket loop.
+                self._callback(data_match, **path_match_kwargs)
+            except Exception:
+                _LOGGER.exception(
+                    "Error in update callback for %s",
+                    self._jq_matcher,
+                )
         return matched
 
 
@@ -115,7 +143,7 @@ class UpdateManager:
         self,
         session: AsyncSmartboxSession,
         device_id: str,
-        **kwargs: dict[str, object],
+        **kwargs: Any,  # noqa: ANN401  # pass-through SocketSession knobs
     ) -> None:
         """Create an UpdateManager for a smartbox socket."""
         self._socket_session = SocketSession(
@@ -123,7 +151,7 @@ class UpdateManager:
             device_id,
             self._dev_data_cb,
             self._update_cb,
-            **kwargs,  # type: ignore[arg-type]
+            **kwargs,
         )
         self._dev_data_subscriptions: list[DevDataSubscription] = []
         self._update_subscriptions: list[UpdateSubscription] = []
@@ -175,7 +203,7 @@ class UpdateManager:
         self,
         callback: Callable[[bool], None],
     ) -> None:
-        """Subscribe to device power limit updates."""
+        """Subscribe to device connected updates."""
         self.subscribe_to_dev_data(
             ".connected",
             lambda p: callback(bool(p)),
@@ -208,7 +236,13 @@ class UpdateManager:
         """Subscribe to node status updates."""
 
         def dev_data_wrapper(data: dict[str, Any]) -> None:
-            (callback(data["type"], int(data["addr"]), data["status"]),)  # type: ignore[func-returns-value]
+            status = data.get("status")
+            if status is None:
+                # jq's {addr, type, status} emits status: null for nodes
+                # that don't carry the key — nothing to report.
+                _LOGGER.debug("Status absent in dev data node, ignoring")
+                return
+            callback(data["type"], int(data["addr"]), status)
 
         self.subscribe_to_dev_data(
             "(.nodes[] | {addr, type, status})?",
@@ -220,10 +254,10 @@ class UpdateManager:
             node_type: str,
             addr: str,
         ) -> None:
-            (callback(node_type, int(addr), data),)  # type: ignore[func-returns-value]
+            callback(node_type, int(addr), data)
 
         self.subscribe_to_updates(
-            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/status",
+            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/status$",
             self.BODY_PATH,
             update_wrapper,
         )
@@ -235,7 +269,13 @@ class UpdateManager:
         """Subscribe to node setup updates."""
 
         def dev_data_wrapper(data: dict[str, Any]) -> None:
-            (callback(data["type"], int(data["addr"]), data["setup"]),)  # type: ignore[func-returns-value]
+            setup = data.get("setup")
+            if setup is None:
+                # jq's {addr, type, setup} emits setup: null for nodes
+                # that don't carry the key — nothing to report.
+                _LOGGER.debug("Setup absent in dev data node, ignoring")
+                return
+            callback(data["type"], int(data["addr"]), setup)
 
         self.subscribe_to_dev_data(
             "(.nodes[] | {addr, type, setup})?",
@@ -247,10 +287,10 @@ class UpdateManager:
             node_type: str,
             addr: str,
         ) -> None:
-            (callback(node_type, int(addr), data),)  # type: ignore[func-returns-value]
+            callback(node_type, int(addr), data)
 
         self.subscribe_to_updates(
-            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/setup",
+            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/setup$",
             self.BODY_PATH,
             update_wrapper,
         )
@@ -262,7 +302,13 @@ class UpdateManager:
         """Subscribe to node version updates."""
 
         def dev_data_wrapper(data: dict[str, Any]) -> None:
-            (callback(data["type"], int(data["addr"]), data["version"]),)  # type: ignore[func-returns-value]
+            version = data.get("version")
+            if version is None:
+                # jq's {addr, type, version} emits version: null for nodes
+                # that don't carry the key — nothing to report.
+                _LOGGER.debug("Version absent in dev data node, ignoring")
+                return
+            callback(data["type"], int(data["addr"]), version)
 
         self.subscribe_to_dev_data(
             "(.nodes[] | {addr, type, version})?",
@@ -274,10 +320,43 @@ class UpdateManager:
             node_type: str,
             addr: str,
         ) -> None:
-            (callback(node_type, int(addr), data),)  # type: ignore[func-returns-value]
+            callback(node_type, int(addr), data)
 
         self.subscribe_to_updates(
-            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/version",
+            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/version$",
+            self.BODY_PATH,
+            update_wrapper,
+        )
+
+    def subscribe_to_node_prog(
+        self,
+        callback: Callable[[str, int, dict[str, Any]], None],
+    ) -> None:
+        """Subscribe to node prog (schedule) updates."""
+
+        def dev_data_wrapper(data: dict[str, Any]) -> None:
+            prog = data.get("prog")
+            if prog is None:
+                # jq's {addr, type, prog} emits prog: null for nodes
+                # that don't carry the key — nothing to report.
+                _LOGGER.debug("Prog absent in dev data node, ignoring")
+                return
+            callback(data["type"], int(data["addr"]), prog)
+
+        self.subscribe_to_dev_data(
+            "(.nodes[] | {addr, type, prog})?",
+            dev_data_wrapper,
+        )
+
+        def update_wrapper(
+            data: dict[str, Any],
+            node_type: str,
+            addr: str,
+        ) -> None:
+            callback(node_type, int(addr), data)
+
+        self.subscribe_to_updates(
+            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/prog$",
             self.BODY_PATH,
             update_wrapper,
         )
@@ -287,11 +366,13 @@ class UpdateManager:
             sub.match(data)
 
     def _update_cb(self, data: dict[str, Any]) -> None:
+        if "path" not in data:
+            # Checked once, not per subscription: with the check inside
+            # the loop a malformed update was logged once per subscription.
+            _LOGGER.error("Path not found in update data: %s", data)
+            return
         matched = False
         for sub in self._update_subscriptions:
-            if "path" not in data:
-                _LOGGER.error("Path not found in update data: %s", data)
-                continue
             if sub.match(data):
                 matched = True
         if not matched:

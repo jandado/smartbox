@@ -6,17 +6,25 @@ import contextlib
 import logging
 import signal
 from typing import Any
-import urllib
+import urllib.parse
 
 import socketio
 
-from smartbox.session import AsyncSmartboxSession
+from smartbox.error import APIUnavailableError, InvalidAuthError, SmartboxError
+from smartbox.session import AsyncSmartboxSession, _redacted_url
 
 _API_V2_NAMESPACE = "/api/v2/socket_io"
 # We most commonly get disconnected when the session
 # expires, so we don't want to try many times
 _DEFAULT_RECONNECT_ATTEMPTS = 10
 _DEFAULT_BACKOFF_FACTOR = 1.0
+# Upper bound on a single disconnect attempt during teardown: on a wedged
+# or half-open websocket the engineio disconnect can block indefinitely.
+_DISCONNECT_TIMEOUT = 5.0
+# Cap on a single reconnect backoff sleep: without it, 10 attempts at
+# backoff_factor 1.0 stall the loop up to ~8.5 min before falling through
+# to the token refresh that usually fixes the disconnect.
+_MAX_RECONNECT_SLEEP = 30.0
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,27 +110,40 @@ class SocketSession:
         backoff_factor: float = _DEFAULT_BACKOFF_FACTOR,
     ) -> None:
         """Init socket session to smartbox."""
+        if ping_interval <= 0:
+            msg = f"ping_interval must be >= 1 second (got {ping_interval})"
+            raise ValueError(msg)
+        if reconnect_attempts < 1:
+            msg = f"reconnect_attempts must be >= 1 (got {reconnect_attempts})"
+            raise ValueError(msg)
         self._session = session
         self._device_id = device_id
         self._ping_interval = ping_interval
         self._reconnect_attempts = reconnect_attempts
         self._backoff_factor = backoff_factor
         self._background_tasks: set[asyncio.Task] = set()
+        self._disconnect_done = False
+        self._loop_should_exit = False
+        # Set together with _loop_should_exit; wakes backoff sleeps so
+        # cancel() takes effect immediately instead of after the sleep.
+        self._exit_event = asyncio.Event()
+        # Loop on which this session installed a SIGINT handler, if any
+        # (so shutdown can drop it again; the handler must not outlive
+        # the session it was installed for).
+        self._sigint_loop: asyncio.AbstractEventLoop | None = None
 
-        if verbose:
-            self._sio = socketio.AsyncClient(
-                logger=True,
-                engineio_logger=True,
-                http_session=self._session.client,
-                reconnection=False,
-            )
-        else:
-            logging.getLogger("socketio").setLevel(logging.ERROR)
-            logging.getLogger("engineio").setLevel(logging.ERROR)
-            self._sio = socketio.AsyncClient(
-                http_session=self._session.client,
-                reconnection=False,
-            )
+        # Without ``verbose`` the socketio/engineio loggers stay under the
+        # host application's logging configuration.
+        # The REST session's websession is bound to the socketio client in
+        # ``run()`` (``_bind_http_session``), not here: materialising it
+        # eagerly would make construction outside a running event loop
+        # fail ("no running event loop" — aiohttp.ClientSession needs one).
+        self._sio = socketio.AsyncClient(
+            logger=verbose,
+            engineio_logger=verbose,
+            http_session=None,
+            reconnection=False,
+        )
 
         self._api_v2_ns = SmartboxAPIV2Namespace(
             session,
@@ -140,7 +161,7 @@ class SocketSession:
                 # have to set our own in the connect callback if we want to
                 # override it
                 _LOGGER.debug("Adding signal handler")
-                event_loop = asyncio.get_event_loop()
+                event_loop = asyncio.get_running_loop()
 
                 def sigint_handler() -> None:
                     _LOGGER.debug("Caught SIGINT, cancelling loop")
@@ -148,17 +169,42 @@ class SocketSession:
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
 
-                event_loop.add_signal_handler(signal.SIGINT, sigint_handler)
+                try:
+                    event_loop.add_signal_handler(signal.SIGINT, sigint_handler)
+                    self._sigint_loop = event_loop
+                except NotImplementedError:
+                    # No signal-handler support (e.g. some Windows event
+                    # loops): keep the connection alive without it.
+                    _LOGGER.debug("SIGINT handler not supported; skipping")
+
+    def _bind_http_session(self) -> None:
+        """Bind the REST session's websession to the socketio client.
+
+        Deferred from ``__init__`` so a SocketSession can be built outside
+        a running event loop (aiohttp.ClientSession needs one); called at
+        the start of ``run()``. ``external_http=True`` marks the session
+        as caller-owned so engineio's disconnect never closes it — it is
+        shared with the REST traffic.
+        """
+        eio = self._sio.eio
+        eio.http = self._session.client
+        eio.external_http = True
 
     async def _dev_data(self) -> None:
         """Send first dev data."""
         if not self._api_v2_ns.connected:
-            _LOGGER.debug("Namespace disconnected, not sending ping")
+            _LOGGER.debug("Namespace disconnected, not sending dev_data")
+            return
         _LOGGER.debug("Sending dev_data event")
         await self._sio.emit("dev_data", namespace=_API_V2_NAMESPACE)
 
     async def _send_ping(self) -> None:
-        """End pings to be alive."""
+        """Send keepalive pings for the lifetime of ``run()``.
+
+        The task spans every reconnect cycle, so a failed send (e.g. the
+        namespace dropping between the ``connected`` check and the send)
+        is logged and skipped — it must not end the keepalive for good.
+        """
         _LOGGER.debug("Starting ping task every %ss", self._ping_interval)
         while True:
             await self._sio.sleep(self._ping_interval)
@@ -166,14 +212,17 @@ class SocketSession:
                 _LOGGER.debug("Namespace disconnected, not sending ping")
                 continue
             _LOGGER.debug("Sending ping")
-            await self._sio.send("ping", namespace=_API_V2_NAMESPACE)
+            try:
+                await self._sio.send("ping", namespace=_API_V2_NAMESPACE)
+            except (socketio.exceptions.SocketIOError, OSError) as e:
+                _LOGGER.debug("Ping not sent: %s", e)
 
     async def _attempt_connection(self, url: str) -> bool:
         """Attempt to connect to the websocket URL.
 
         Returns True if connection was successful, False otherwise.
         """
-        _LOGGER.debug("Connecting to %s", url)
+        _LOGGER.debug("Connecting to %s", _redacted_url(url))
         try:
             connect_task = asyncio.create_task(
                 self._sio.connect(url, transports=["websocket"])
@@ -207,13 +256,33 @@ class SocketSession:
                     task.add_done_callback(self._background_tasks.discard)
 
                 raise
-            _LOGGER.info("Successfully connected to %s", url)
+            _LOGGER.info("Successfully connected to %s", _redacted_url(url))
+            if self._loop_should_exit:
+                # cancel() ran while we were connecting: its one-shot
+                # disconnect already happened, so drop this fresh
+                # connection here instead of parking on it forever.
+                _LOGGER.debug("Exit requested during connect; disconnecting")
+                await self._disconnect_now()
+                return True
             await self._dev_data()
             await self._sio.wait()
             await self._cleanup_websocket()
             with contextlib.suppress(Exception):
                 await self._sio.disconnect()
-        except socketio.exceptions.ConnectionError:
+        except (
+            socketio.exceptions.SocketIOError,
+            TimeoutError,
+            OSError,
+        ) as e:
+            # SocketIOError (not just its ConnectionError subclass): the
+            # first dev_data emit races the server drop (connected check
+            # then send), which surfaces as a BadNamespaceError — a
+            # *sibling* of ConnectionError. Swallowing only ConnectionError
+            # let it escape and end the run loop for good; all SocketIOError
+            # variants go through the outer backoff/reconnect cycle instead.
+            # TimeoutError/OSError can escape from the underlying websocket
+            # transport on transient DNS/socket hiccups.
+            _LOGGER.debug("Connection attempt failed: %s", e)
             return False
         return True
 
@@ -234,29 +303,88 @@ class SocketSession:
                 e,
             )
 
+    async def _disconnect_once(self) -> None:
+        """Disconnect exactly once, bounded by a timeout.
+
+        Concurrent/serialised disconnect attempts on the same AsyncClient
+        can trip internal state races, and a wedged websocket can make the
+        engineio disconnect block indefinitely — both callers (cancel and
+        shutdown) funnel through here.
+        """
+        if self._disconnect_done:
+            return
+        self._disconnect_done = True
+        await self._disconnect_now()
+
+    async def _disconnect_now(self) -> None:
+        """Disconnect the client, bounded by ``_DISCONNECT_TIMEOUT``."""
+        inner = asyncio.ensure_future(self._sio.disconnect())
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(inner),
+                timeout=_DISCONNECT_TIMEOUT,
+            )
+        except TimeoutError:
+            _LOGGER.warning(
+                "Timed out after %ss waiting for websocket disconnect",
+                _DISCONNECT_TIMEOUT,
+            )
+            # Stop the wedged disconnect task and reap it (bounded) so it
+            # cannot linger as "Task was destroyed but it is pending".
+            inner.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({inner}, timeout=_DISCONNECT_TIMEOUT)
+        except asyncio.CancelledError:
+            _LOGGER.debug("Disconnect interrupted; stopping disconnect task")
+            inner.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({inner}, timeout=_DISCONNECT_TIMEOUT)
+            raise
+        except OSError as e:
+            _LOGGER.debug("Silent error on disconnect: %s", e)
+
+    def _remove_sigint_handler(self) -> None:
+        """Drop the SIGINT handler this session installed (if any)."""
+        loop, self._sigint_loop = self._sigint_loop, None
+        if loop is None:
+            return
+        try:
+            loop.remove_signal_handler(signal.SIGINT)
+        except RuntimeError, ValueError:
+            _LOGGER.debug("Could not remove SIGINT handler", exc_info=True)
+
     async def run(self) -> None:
         """Run the websocket."""
+        self._bind_http_session()
         self._ping_task = self._sio.start_background_task(self._send_ping)
-        self._loop_should_exit = False
 
         _LOGGER.debug("Starting main loop")
         try:
+            # Authenticate before the first connect attempt: without this,
+            # a cold session (no prior REST call, e.g. the CLI ``socket``
+            # command) burns every reconnect attempt on an empty/stale
+            # token before the fall-through refresh below fixes it on the
+            # next cycle.
+            await self._refresh_auth()
             while not self._loop_should_exit:
                 encoded_token = urllib.parse.quote(
                     self._session.access_token,
                     safe="~()*!.'",
                 )
                 url = f"{self._session.api_host}/?token={encoded_token}&dev_id={self._device_id}"
+                redacted_url = _redacted_url(url)
 
                 # Try to connect
                 _LOGGER.debug(
                     "Connecting to %s (will try %s times)",
-                    url,
+                    redacted_url,
                     self._reconnect_attempts,
                 )
                 for attempt in range(self._reconnect_attempts):
+                    if self._loop_should_exit:
+                        break
                     _LOGGER.debug(
-                        "Connecting to %s (attempt #%s)", url, attempt
+                        "Connecting to %s (attempt #%s)", redacted_url, attempt
                     )
 
                     if await self._attempt_connection(url):
@@ -264,20 +392,32 @@ class SocketSession:
                         break
 
                     remaining = self._reconnect_attempts - attempt - 1
-                    sleep_time = self._backoff_factor * (2**attempt)
-                    _LOGGER.exception(
+                    sleep_time = min(
+                        self._backoff_factor * (2**attempt),
+                        _MAX_RECONNECT_SLEEP,
+                    )
+                    _LOGGER.warning(
                         "Received error on connection attempt, %s retries remaining, sleeping %ss",
                         remaining,
                         sleep_time,
                     )
                     if remaining > 0:
-                        await asyncio.sleep(sleep_time)
+                        await self._sleep_unless_exiting(sleep_time)
                     else:
                         _LOGGER.warning(
                             "Failed to connect after %s attempts, falling through to refresh token",
                             self._reconnect_attempts,
                         )
-                await self._session.check_refresh_auth()
+                if self._loop_should_exit:
+                    # Exit before touching the REST API so cancel is not
+                    # delayed by a slow/unreachable auth refresh.
+                    break
+                await self._refresh_auth()
+                # Small pause between connection cycles: the per-attempt
+                # backoff above only covers failed connects, so a server
+                # that accepts-then-drops would otherwise spin us in a hot
+                # reconnect loop.
+                await self._sleep_unless_exiting(self._backoff_factor)
         except asyncio.CancelledError:
             _LOGGER.debug("WebSocket loop cancelled by Home Assistant")
             raise
@@ -285,27 +425,97 @@ class SocketSession:
             _LOGGER.debug("Cleaning up socketio...")
             await self.shutdown()
 
+    async def _refresh_auth(self) -> None:
+        """Refresh the REST token the socket URL carries.
+
+        Transient failures (API unreachable, 5xx, malformed token
+        response) are waited out with capped backoff: a network blip at
+        refresh time must not end the websocket loop for good. Rejected
+        credentials (``InvalidAuthError``, raised only after the session's
+        password-login fallback also failed) propagate out of ``run()``.
+        Returns early once an exit is requested.
+        """
+        failures = 0
+        while not self._loop_should_exit:
+            try:
+                await self._session.check_refresh_auth()
+            except InvalidAuthError:
+                _LOGGER.warning(
+                    "Credentials rejected; stopping websocket loop for %s",
+                    self._device_id,
+                )
+                raise
+            except (APIUnavailableError, SmartboxError) as e:
+                sleep_time = min(
+                    self._backoff_factor * (2**failures),
+                    _MAX_RECONNECT_SLEEP,
+                )
+                failures += 1
+                _LOGGER.warning(
+                    "Auth refresh failed (%s); retrying in %ss",
+                    e,
+                    sleep_time,
+                )
+                await self._sleep_unless_exiting(sleep_time)
+            else:
+                return
+
+    async def _sleep_unless_exiting(self, delay: float) -> None:
+        """Sleep up to ``delay`` seconds, waking early once exit is requested."""
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._exit_event.wait(), timeout=delay)
+
+    def _request_exit(self) -> None:
+        """Flag the run loop to stop and wake any backoff sleep."""
+        self._loop_should_exit = True
+        self._exit_event.set()
+
+    async def _stop_ping(self) -> None:
+        """Cancel and reap the ping task (bounded) so it cannot linger."""
+        if not hasattr(self, "_ping_task"):
+            return
+        task = self._ping_task
+        if not isinstance(task, asyncio.Task) or task.done():
+            return
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=_DISCONNECT_TIMEOUT)
+        except (asyncio.CancelledError, TimeoutError, OSError) as e:
+            _LOGGER.debug("Ping task stopped: %s", e)
+
     async def cancel(self) -> None:
         """Disconnecting and cancelling tasks."""
         _LOGGER.debug("Disconnecting and cancelling tasks")
-        self._loop_should_exit = True
-        if hasattr(self, "_ping_task") and not self._ping_task.done():
-            self._ping_task.cancel()
-        try:
-            await asyncio.shield(self._sio.disconnect())
-        except (asyncio.CancelledError, OSError) as e:
-            _LOGGER.debug("Silent error on disconnect: %s", e)
+        self._request_exit()
+        await self._stop_ping()
+        await self._disconnect_once()
 
     async def shutdown(self) -> None:
         """Shutdown the socket session."""
-        self._loop_should_exit = True
-        if hasattr(self, "_ping_task") and not self._ping_task.done():
-            self._ping_task.cancel()
-
-        try:
-            await asyncio.shield(self._sio.disconnect())
-        except (asyncio.CancelledError, OSError) as e:
-            _LOGGER.debug("Silent error on disconnect: %s", e)
+        self._request_exit()
+        self._remove_sigint_handler()
+        await self._stop_ping()
+        await self._disconnect_once()
+        if self._background_tasks:
+            pending = [
+                task for task in self._background_tasks if not task.done()
+            ]
+            if pending:
+                # e.g. _cleanup_dangling_socket tasks: await (bounded) so
+                # they don't die as "Task was destroyed but it is pending"
+                # noise at loop teardown.
+                _, still_pending = await asyncio.wait(
+                    pending, timeout=_DISCONNECT_TIMEOUT
+                )
+                for task in still_pending:
+                    task.cancel()
+                if still_pending:
+                    # Reap the cancelled ones (bounded) so they cannot
+                    # linger as "Task was destroyed but it is pending".
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.wait(
+                            still_pending, timeout=_DISCONNECT_TIMEOUT
+                        )
 
     @property
     def namespace(self) -> SmartboxAPIV2Namespace:

@@ -2,12 +2,12 @@
 
 import json
 import logging
-from typing import Any
+from typing import Any, cast
 
-from aiohttp import ClientSession
 import asyncclick as click
 
-from smartbox.reseller import AvailableResellers
+from smartbox.error import APIUnavailableError, InvalidAuthError, SmartboxError
+from smartbox.reseller import AvailableResellers, ResellerNotExistError
 from smartbox.session import AsyncSmartboxSession
 from smartbox.socket import SocketSession
 
@@ -19,16 +19,95 @@ def _pretty_print(data: dict[str, Any]) -> None:
     print(json.dumps(data, indent=4, sort_keys=True))
 
 
-@click.group(chain=True)
-@click.option("-a", "--api-name", required=False, help="API name")
+async def _resolve_device(
+    session: AsyncSmartboxSession, device_id: str
+) -> dict[str, Any]:
+    """Find a device by id, with a clean error instead of a traceback."""
+    devices = cast("list[dict[str, Any]]", await session.get_devices())
+    device = next((d for d in devices if d["dev_id"] == device_id), None)
+    if device is None:
+        msg = f"no device with dev_id {device_id!r}"
+        raise click.ClickException(msg)
+    return device
+
+
+async def _resolve_node(
+    session: AsyncSmartboxSession, device_id: str, node_addr: int
+) -> dict[str, Any]:
+    """Find a node by address, with a clean error instead of a traceback.
+
+    Node dicts carry an int addr on the wire; coerce defensively since
+    raw-response payloads are unvalidated.
+    """
+    nodes = cast(
+        "list[dict[str, Any]]",
+        await session.get_nodes(device_id),
+    )
+
+    def _wire_addr(node: dict[str, Any]) -> int:
+        try:
+            return int(node["addr"])
+        except (KeyError, TypeError, ValueError) as e:
+            # Missing key (KeyError), non-numeric value (ValueError) or
+            # non-scalar (TypeError) on the unvalidated wire payload.
+            msg = f"malformed node payload (bad addr): {node!r}"
+            raise click.ClickException(msg) from e
+
+    node = next((n for n in nodes if _wire_addr(n) == node_addr), None)
+    if node is None:
+        msg = f"no node with addr {node_addr} on device {device_id!r}"
+        raise click.ClickException(msg)
+    return node
+
+
+class SmartboxGroup(click.Group):
+    """Group mapping session/API failures to clean CLI errors.
+
+    Without this, auth/network/reseller failures surfaced as raw
+    tracebacks for every command.
+    """
+
+    async def invoke(self, ctx: click.Context) -> Any:  # noqa: ANN401
+        """Invoke the chain, mapping session errors to clean CLI errors."""
+        try:
+            return await super().invoke(ctx)
+        except (
+            SmartboxError,
+            InvalidAuthError,
+            APIUnavailableError,
+            ResellerNotExistError,
+        ) as e:
+            raise click.ClickException(str(e)) from e
+
+
+@click.group(chain=True, cls=SmartboxGroup)
+@click.option(
+    "-a",
+    "--api-name",
+    default="api",
+    show_default=True,
+    help="API name (see the ``resellers`` command)",
+)
 @click.option(
     "-b",
     "--basic-auth-creds",
     required=False,
     help="API basic auth credentials",
 )
-@click.option("-u", "--username", required=True, help="API username")
-@click.option("-p", "--password", required=True, help="API password")
+@click.option(
+    "-u",
+    "--username",
+    required=True,
+    help="API username",
+    envvar="SMARTBOX_USERNAME",
+)
+@click.option(
+    "-p",
+    "--password",
+    required=True,
+    help="API password",
+    envvar="SMARTBOX_PASSWORD",
+)
 @click.option(
     "-v",
     "--verbose/--no-verbose",
@@ -36,7 +115,13 @@ def _pretty_print(data: dict[str, Any]) -> None:
     help="Enable verbose logging",
 )
 @click.option("-r", "--x-referer", required=False, help="Refere of API")
-@click.option("-i", "--x-serial-id", required=False, help="Serial id of API")
+@click.option(
+    "-i",
+    "--x-serial-id",
+    required=False,
+    type=int,
+    help="Serial id of API",
+)
 @click.pass_context
 async def smartbox(
     ctx,
@@ -61,12 +146,14 @@ async def smartbox(
         basic_auth_credentials=basic_auth_creds,
         username=username,
         password=password,
-        websession=ClientSession(),
         x_referer=x_referer,
         x_serial_id=x_serial_id,
     )
     ctx.obj["session"] = session
     ctx.obj["verbose"] = verbose
+    # The library creates (and owns) its client session lazily; close it
+    # when the CLI context tears down.
+    ctx.call_on_close(session.aclose_owned_session)
 
 
 @smartbox.command(help="Show devices")
@@ -149,16 +236,13 @@ async def status(ctx) -> None:
 async def node_samples(
     ctx,
     device_id: str,
-    node_addr: str,
+    node_addr: int,
     start_time: int,
     end_time: int,
 ) -> None:
     """Show node temperatures and consumption history."""
     session = ctx.obj["session"]
-    devices = await session.get_devices()
-    device = next(d for d in devices if d["dev_id"] == device_id)
-    nodes = await session.get_nodes(device["dev_id"])
-    node = next(n for n in nodes if n["addr"] == node_addr)
+    node = await _resolve_node(session, device_id, node_addr)
 
     node_samples = await session.get_node_samples(
         device_id,
@@ -193,15 +277,18 @@ async def node_samples(
 async def set_status(
     ctx,
     device_id: str,
-    node_addr: str,
+    node_addr: int,
     **kwargs: dict[str, Any],
 ) -> None:
     """Set node status."""
     session = ctx.obj["session"]
-    devices = await session.get_devices()
-    device = next(d for d in devices if d["dev_id"] == device_id)
-    nodes = await session.get_nodes(device["dev_id"])
-    node = next(n for n in nodes if n["addr"] == node_addr)
+    device = await _resolve_device(session, device_id)
+    node = await _resolve_node(session, device_id, node_addr)
+
+    if kwargs.get("stemp") is not None and kwargs.get("units") is None:
+        # The library raises ValueError here; map it to a clean CLI error.
+        msg = "must supply --units with --stemp"
+        raise click.ClickException(msg)
 
     await session.set_node_status(device["dev_id"], node, kwargs)
 
@@ -247,19 +334,85 @@ async def setup(ctx) -> None:
 async def set_setup(
     ctx,
     device_id: str,
-    node_addr: str,
+    node_addr: int,
     **kwargs: dict[str, Any],
 ) -> None:
     """Set node setup options."""
     session = ctx.obj["session"]
-    devices = await session.get_devices()
-    device = next(d for d in devices if d["dev_id"] == device_id)
-    nodes = await session.get_nodes(device["dev_id"])
-    node = next(n for n in nodes if n["addr"] == node_addr)
+    device = await _resolve_device(session, device_id)
+    node = await _resolve_node(session, device_id, node_addr)
 
     # Only pass specified options
     setup_kwargs = {k: v for k, v in kwargs.items() if v is not None}
     await session.set_node_setup(device["dev_id"], node, setup_kwargs)
+
+
+@smartbox.command(help="Show node prog")
+@click.pass_context
+async def prog(ctx) -> None:
+    """Show node prog."""
+    session = ctx.obj["session"]
+    devices = await session.get_devices()
+
+    for device in devices:
+        print(f"{device['name']} (dev_id: {device['dev_id']})")
+        nodes = await session.get_nodes(device["dev_id"])
+
+        for node in nodes:
+            print(f"{node['name']} (addr: {node['addr']})")
+            prog = await session.get_node_prog(device["dev_id"], node)
+            _pretty_print(prog)
+
+
+@smartbox.command(
+    help=(
+        "Set node prog from a JSON string, e.g. "
+        '\'{"prog": {"0": [2, 2, ...], ...}}\''
+    ),
+)
+@click.option(
+    "-d",
+    "--device-id",
+    required=True,
+    help="Device ID for node to set prog on",
+)
+@click.option(
+    "-n",
+    "--node-addr",
+    type=int,
+    required=True,
+    help="Address of node to set prog on",
+)
+@click.argument("prog-json", type=str)
+@click.pass_context
+async def set_prog(
+    ctx,
+    device_id: str,
+    node_addr: int,
+    prog_json: str,
+) -> None:
+    """Set node prog."""
+    session = ctx.obj["session"]
+    device = await _resolve_device(session, device_id)
+    node = await _resolve_node(session, device_id, node_addr)
+
+    try:
+        prog_args = json.loads(prog_json)
+    except json.JSONDecodeError as err:
+        msg = f"invalid prog JSON: {err}"
+        raise click.ClickException(msg) from err
+    if not isinstance(prog_args, dict) or not isinstance(
+        prog_args.get("prog"),
+        dict,
+    ):
+        # Reject array shapes / day-keyed-top-level bodies with a clean
+        # error instead of an AttributeError or a silent no-op POST.
+        msg = (
+            "prog payload must be a JSON object with a 'prog' object "
+            'mapping day keys, e.g. {"prog": {"0": [2, 2, ...]}}'
+        )
+        raise click.ClickException(msg)
+    await session.set_node_prog(device["dev_id"], node, prog_args)
 
 
 @smartbox.command(help="Show device away_status")
@@ -312,8 +465,7 @@ async def set_device_away_status(
 ) -> None:
     """Set device away status."""
     session = ctx.obj["session"]
-    devices = await session.get_devices()
-    device = next(d for d in devices if d["dev_id"] == device_id)
+    device = await _resolve_device(session, device_id)
 
     await session.set_device_away_status(device["dev_id"], kwargs)
 
@@ -345,8 +497,7 @@ async def device_power_limit(ctx) -> None:
 async def set_device_power_limit(ctx, device_id: str, power_limit: int) -> None:
     """Set device power limit."""
     session = ctx.obj["session"]
-    devices = await session.get_devices()
-    device = next(d for d in devices if d["dev_id"] == device_id)
+    device = await _resolve_device(session, device_id)
 
     await session.set_device_power_limit(device["dev_id"], power_limit)
 
@@ -406,8 +557,8 @@ async def api_version(ctx) -> None:
 @smartbox.command(help="Get the availables resellers.")
 def resellers() -> None:
     """Get the availables resellers."""
-    for item in AvailableResellers.resellers.items():
-        print(item)
+    for name, reseller in AvailableResellers.resellers.items():
+        print(f"{name}: {reseller.name} (api_url: {reseller.api_url})")
 
 
 @smartbox.command(help="Get the home guest")
@@ -419,7 +570,7 @@ def resellers() -> None:
 )
 @click.pass_context
 async def guests(ctx, home_id: str) -> None:
-    """Set device power limit."""
+    """Get the home guests."""
     session = ctx.obj["session"]
     guests = await session.get_home_guests(home_id=home_id)
     _pretty_print(guests)

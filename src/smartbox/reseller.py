@@ -118,14 +118,7 @@ class AvailableResellers:
     @property
     def reseller(self) -> SmartboxReseller:
         """Get the reseller."""
-        reseller = next(
-            (
-                value
-                for key, value in self.resellers.items()
-                if key == self._api_url
-            ),
-            None,
-        )
+        reseller = self.resellers.get(self._api_url)
         if reseller is None:
             if (
                 self._basic_auth is None
@@ -135,12 +128,13 @@ class AvailableResellers:
                 msg = f"This reseller {self._api_url} is not yet available or some arguments are missing."
                 raise ResellerNotExistError(msg)
             try:
+                # Note: never log basic_auth — callers may supply their own
+                # credential for unknown resellers.
                 _LOGGER.debug(
-                    "Creating a new reseller api_url (%s), name=%s,  web_url %s, basic_auth=%s, serial_id=%s",
+                    "Creating a new reseller api_url (%s), name=%s, web_url %s, serial_id=%s",
                     self._api_url,
                     self._name,
                     self._web_url,
-                    self._basic_auth,
                     self._serial_id,
                 )
                 reseller = SmartboxReseller(
@@ -172,5 +166,5 @@ class AvailableResellers:
 
     @property
     def web_url(self) -> str:
-        """Get the public websit of the reseller."""
+        """Get the public website of the reseller."""
         return self.reseller.web_url
