@@ -528,3 +528,23 @@ where noted; paths come from the app bundle + spec.
   fallback makes it irrelevant for availability.
 * **Deadline**: `_CALL_TIMEOUT` = 30s per library call (refresh +
   retries + backoff), independent of whose websession is used.
+
+#### Box-device round (2026-09-29, integration side)
+Integration round that consumed the device-level surface; open questions
+routed here per the routing rules.
+* **Open question — RTC month indexing**: `GET /devs/<id>/mgr/rtc/time` `n`
+  is 0-indexed (September → 8, live-verified 2026-09-27; integration's
+  `rtc_time_to_datetime` assumes month = `n + 1`). December unverified —
+  whether `n` wraps to 0 (0-indexed) or 12 (1-indexed) is unknown. Check
+  live or capture a December frame.
+* **Open question — power-limit 0 POST**: integration now treats
+  `GET/POST /devs/<id>/htr_system/power_limit` `power_limit == 0` as
+  "no limit" (user-confirmed semantics; web UI caps the editable range at
+  60000). Whether the server actually ACCEPTS a POST of `power_limit: 0`
+  (vs rejecting/reverting it) is not yet live-verified — test before
+  trusting the NoPowerLimitSwitch on→0 path.
+* **Open question — away enabled/forced**: `mgr/away_status` returns the
+  full `{away, enabled, forced}` triple; the integration now surfaces all
+  three as attributes but only ever POSTs `{away: bool}` — confirm the
+  server-side meaning of `enabled`/`forced` (who may set them, what
+  `enabled: false` does to an away write).
