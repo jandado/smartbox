@@ -293,7 +293,9 @@ Findings:
   `mode: "auto"` leaves `mode: "auto"` unchanged on the wire, even though
   the mode value exists in the integration's mapping and setup exposes
   `modified_auto_span: 6` (semantics appear handled device-side without a
-  mode flip, at least on fw 1.9).
+  mode flip, at least on fw 1.9). Partially superseded by the
+  2026-09-28 A/B probe below: the stored value DOES drive the heater; the
+  mode only flips when `mode: "modified_auto"` is explicitly sent.
 * Socket frames for these writes: `/htr/5/status` update frames arrive
   ~0.5 s after each POST with **full status bodies** including the new
   `stemp`; unrelated schedule changes on other auto heaters appeared as
@@ -305,7 +307,45 @@ Findings:
   `stemp` POST per affected heater. Snapshot-diff restore checks must
   treat schedule-driven `stemp` changes on auto heaters as expected drift.
 
-[socket.io]: https://socket.io/
+## Setpoint-in-auto A/B probe (2026-09-28, tools/probe_modified_auto.py, tools/probe_settle_window.py)
+
+Decisive A/B on `htr/5` (auto, stemp 19.0, mtemp 20.3), distinct set points
+so the physical response is unambiguous:
+
+| Write | Wire result | Heater behavior |
+|---|---|---|
+| `{"stemp": <mtemp+1>, "units": "C"}` (no mode key) | stored (0.5-grid quantized), `mode` stays `auto` | **applied**: `active=True duty=100`, climbing |
+| `{"stemp": <p1+1.5>, "units": "C", "mode": "modified_auto"}` | `mode` flips to `modified_auto`, stemp stored | applied; override persists (no self-revert within a 60 s window) |
+| `{"mode": "auto"}` (from modified_auto) | reverts to `auto` | override cleared |
+
+Findings:
+
+* A plain `{stemp, units}` write in auto is not just stored — it **drives
+  the heater** once the API is settled (the first probe round's control was
+  ambiguous: its set point sat below room temp, so the heater was idle
+  either way).
+* An **immediate (0 s) follow-up write inside the post-write settle window
+  also applies** (`probe_settle_window.py` S1 vs S2 control, identical
+  results): no settle-window write drop for mode→stemp sequences on this
+  family.
+* `modified_auto` is engaged **only by explicitly sending
+  `mode: "modified_auto"`** (the app's body, webapi-spec.md §4.2); it does
+  not self-revert within the observation window — reverting needs
+  `{"mode": "auto"}` (the app's UX additionally reverts at the next
+  differing programme temperature, per user report, not re-verified here).
+* **Off-grid setpoints are silently quantized to the 0.5 °C grid**
+  (`21.3→21.0`, `22.8→22.5`, `22.4→22.0`). The app always sends on-grid
+  values; API clients should round before POSTing. App UI step:
+  0.5 °C / 1 °F (user-verified against the app, 2026-09-28).
+* Fleet restore verified clean both rounds (`DONE failures=0`, controlled
+  fields exact).
+* OPEN FINDING (cause unknown, needs a frame capture): during/after the
+  probing the backend reported state disagreeing with the physical heater
+  (setpoint off by 2-3° with the user standing at the heater; phantom
+  `active=True duty=100` for minutes while not heating). The probe wrote
+  rapid modified_auto engage/revert cycles, no-op mode writes and off-grid
+  values — none individually undocumented, but the pattern was unusual.
+  Do not attribute without a watch_status.py capture of a recurrence.
 
 [socket.io]: https://socket.io/
 

@@ -98,9 +98,21 @@ first POSTs the deactivate for the previous mode, then activates the new one
 without those modes active.
 
 `modified_auto`: exists as an app-level mode value; on fw 1.9 the device does
-not reflect it on the wire when not explicitly sent. Unverified whether
-sending `mode:"modified_auto"` explicitly changes device behaviour — treat as
-open item; integration need not use it.
+not reflect it on the wire when not explicitly sent. Sending it explicitly
+(the §4.2 body) DOES engage it (live-probed 2026-09-28,
+tools/probe_modified_auto.py): the mode flips, the heater follows, and the
+override persists until reverted with `{"mode": "auto"}` (no self-revert
+within a 60 s window; the app's UX reverts at the next differing programme
+temperature). CONFIRMED by direct capture of the web app on this hardware
+(2026-09-28): bumping the temp in auto posts exactly
+`{"stemp":"20.5","units":"C","mode":"modified_auto"}` — the 3-key body is
+the app's production behavior on these units. The HA integration now sends
+this body for setpoints in auto, gated on `modified_auto_span` in setup
+(the app's INDEPENDENT_TEMP_AND_MODE_ON_UPDATE capability is not
+wire-visible).
+Also: off-grid setpoints silently quantize to the 0.5 °C grid — round
+before POSTing; the app's UI step is 0.5 °C / 1 °F (user-verified against
+the app, 2026-09-28).
 
 
 ## 5. Schedule model (the scheduling feature's core)
