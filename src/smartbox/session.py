@@ -161,7 +161,7 @@ def _validate[M: BaseModel](model: type[M], payload: object, what: str) -> M:
         # payload goes to debug only (the caller decides how loud to be).
         _LOGGER.debug("%s validation error, payload: %s", what, payload)
         msg = f"Unexpected {what} payload: {e}"
-        raise SmartboxValidationError(msg) from e
+        raise SmartboxValidationError(msg, payload) from e
 
 
 def _raw_list(payload: object, what: str, key: str | None = None) -> list[Any]:

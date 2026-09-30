@@ -548,3 +548,56 @@ routed here per the routing rules.
   three as attributes but only ever POSTs `{away: bool}` — confirm the
   server-side meaning of `enabled`/`forced` (who may set them, what
   `enabled: false` does to an away write).
+
+## Node reachability ("unreachable" heater) — 2026-09-30, live probes
+
+User cut power to one htr node while the box stayed up. All observations
+below are from that session (htr/3 on a 5-node device).
+
+* **Device-level `/devs/<id>/connected` stays `true`** when a node loses
+  power — the gateway is fine. Node unreachability is ONLY visible via the
+  node-level `sync_status: "lost"` marker (on `/status` and `/setup`
+  payloads); there is no per-node connected endpoint. The websocket
+  `/connected` event is device-level too.
+* **Offline node's `/status` GET eventually returns a BARE
+  `{"sync_status": "lost"}`** payload — no mode/temps/power keys at all.
+  `/setup` keeps the full field set but with `sync_status: "lost"`.
+  `mgr/nodes` carries a per-node `lost` boolean, but it stayed `false` for
+  the unreachable node (do not trust it for this).
+* **Latency of the server-side flip**: with ZERO traffic after the power
+  cut, the server kept serving the full last-known `ok` status for 3.5+
+  minutes; the bare-lost state was in place ~11 min later. (Under a 7 s
+  write cadence the server pushed its first bare-lost status frame ~67 s
+  after the storm began, and a second one ~95 s after that — pushes DO
+  reach already-connected sockets once the server concludes the node is
+  lost; whether an idle node's flip is pushed to a connected socket at all
+  is UNVERIFIED, open.)
+* **Writes to unreachable nodes are silently accepted**: POST `/status`
+  returns OK in ~50–60 ms with no error, regardless of node state. There
+  is NO device-ack round trip in the write path. Consequence: the ONLY
+  fast signal that a write did not land is the ABSENCE of the confirming
+  ok status frame (which arrives within ~0.3–0.5 s on a live node).
+  The vendor app flags a node unreachable ~5–6 s after a command whose
+  confirmation never arrives — a client-side timeout, not an API answer
+  (its bundle never references `sync_status`).
+* **No-op (idempotent) writes produce NO frames at all**, even on live
+  nodes — a `mode: off → off` POST caused no transient lost, no ok push.
+  The transient post-write lost→ok pattern therefore only fires for
+  value-changing writes (and did not reproduce at all in the 2026-09-30
+  session; treat the 2026-09-26 documentation as defensive knowledge).
+* **Recovery is pushed**: full fresh ok status frame arrived ~5 s after
+  power-on with zero commands. Boot frames first carry garbage
+  (`error_code: 5`, `mtemp: -2764.8`, `duty: 106`, `ice_temp: "2.5"`)
+  before settling within seconds — an availability consumer should not
+  render the garbage as real state (availability flips True, values get
+  overwritten by the settling frame).
+* Library surface added in 2.6.1:
+  `UpdateManager.subscribe_to_node_availability` /
+  `.get_node_availability` / `.expect_write_confirmation` (knobs:
+  `unavailable_delay`, `write_confirm_timeout`). Discriminator rule: a
+  lost-marked GET payload (bare-lost status, or full-field setup with a
+  lost marker) is never evidence of an applied write — a value-equal
+  write to a dead node flips Unavailable once the server flips. Typed
+  mode: the bare-lost status payload fails NodeStatus validation, so
+  `SmartboxValidationError` carries the wire `payload` and a
+  lost-marked one counts as the Unavailable verdict.

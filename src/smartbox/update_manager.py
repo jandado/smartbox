@@ -1,18 +1,46 @@
 """Smartbox socket update manager."""
 
+import asyncio
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 import logging
 import re
 from typing import Any, ClassVar
 
 import jq
+from pydantic import BaseModel
 
+from smartbox.error import (
+    APIUnavailableError,
+    SmartboxError,
+    SmartboxValidationError,
+)
 from smartbox.session import AsyncSmartboxSession
 from smartbox.socket import SocketSession
 
 _LOGGER = logging.getLogger(__name__)
 
 _SIMPLE_JQ_RE = re.compile(r"^\.(\w+)$")
+
+# How long a node-status/setup frame reporting ``sync_status: lost`` may
+# remain unconfirmed before the node is reported unavailable. Matches the
+# vendor app's short unreachable window (live-probed 2026-09-30).
+_DEFAULT_UNAVAILABLE_DELAY = 6.0
+# How long an accepted write may go unconfirmed (no ok frame) before a
+# one-shot discriminating GET decides whether the write landed.
+_DEFAULT_WRITE_CONFIRM_TIMEOUT = 6.0
+# Tolerance for comparing numeric strings of differing precision.
+_FLOAT_EPSILON = 1e-6
+
+
+@dataclass
+class _PendingWrite:
+    """A write awaiting its confirming websocket frame."""
+
+    node: dict[str, Any]
+    written: dict[str, Any]
+    kind: str = "status"
+    task: asyncio.Task | None = field(default=None)
 
 
 class OptimisedJQMatcher:
@@ -143,9 +171,15 @@ class UpdateManager:
         self,
         session: AsyncSmartboxSession,
         device_id: str,
+        write_confirm_timeout: float = _DEFAULT_WRITE_CONFIRM_TIMEOUT,
+        unavailable_delay: float = _DEFAULT_UNAVAILABLE_DELAY,
         **kwargs: Any,  # noqa: ANN401  # pass-through SocketSession knobs
     ) -> None:
         """Create an UpdateManager for a smartbox socket."""
+        self._session = session
+        self._device_id = device_id
+        self._write_confirm_timeout = write_confirm_timeout
+        self._unavailable_delay = unavailable_delay
         self._socket_session = SocketSession(
             session,
             device_id,
@@ -155,6 +189,18 @@ class UpdateManager:
         )
         self._dev_data_subscriptions: list[DevDataSubscription] = []
         self._update_subscriptions: list[UpdateSubscription] = []
+        # Node-availability tracking (see subscribe_to_node_availability).
+        # The internal frame taps are registered lazily on first use so
+        # consumers that never enable the feature see the exact same
+        # subscription counts as before.
+        self._availability_taps_registered = False
+        self._availability_callbacks: list[
+            Callable[[str, int, bool], None]
+        ] = []
+        self._node_availability: dict[tuple[str, int], bool] = {}
+        # Per-node timers: lost-frame unavailability + write-confirmation.
+        self._lost_timers: dict[tuple[str, int], asyncio.Task] = {}
+        self._pending_confirms: dict[tuple[str, int, str], _PendingWrite] = {}
 
     @property
     def socket_session(self) -> SocketSession:
@@ -167,6 +213,19 @@ class UpdateManager:
 
     async def cancel(self) -> None:
         """Disconnecting and cancelling tasks."""
+        tasks: list[asyncio.Task] = list(self._lost_timers.values())
+        tasks.extend(
+            pending.task
+            for pending in self._pending_confirms.values()
+            if pending.task is not None
+        )
+        for task in tasks:
+            task.cancel()
+        self._lost_timers.clear()
+        self._pending_confirms.clear()
+        # The socket cancel below is the yield point at which the
+        # cancellations above are actually processed; nothing here awaits
+        # them separately (verified: no un-retrieved/destroyed warnings).
         await self._socket_session.cancel()
 
     def subscribe_to_dev_data(self, jq_expr: str, callback: Callable) -> None:
@@ -361,6 +420,296 @@ class UpdateManager:
             update_wrapper,
         )
 
+    def subscribe_to_node_availability(
+        self,
+        callback: Callable[[str, int, bool], None],
+    ) -> None:
+        """Subscribe to node availability (reachable/unreachable) updates.
+
+        Callback signature: ``(node_type, addr, available)``. Availability
+        reflects whether the box can currently reach the node: a node whose
+        status frames carry ``sync_status: "lost"`` without a subsequent ok
+        frame is reported unavailable; any ok frame reports it available
+        again.
+
+        The node status/setup frame taps used here are shared with
+        :meth:`expect_write_confirmation`; each feature enables them
+        independently — neither depends on the other.
+        """
+        # Identity-dedupe: a consumer that re-subscribes the same callback
+        # (config reload, retry) must not double every availability event.
+        if callback not in self._availability_callbacks:
+            self._availability_callbacks.append(callback)
+        self._ensure_availability_taps()
+
+    def get_node_availability(self, node_type: str, addr: int) -> bool | None:
+        """Return the last known availability of a node, or None if unknown."""
+        return self._node_availability.get((node_type, addr))
+
+    def expect_write_confirmation(
+        self,
+        node: dict[str, Any],
+        written: dict[str, Any],
+        kind: str = "status",
+    ) -> None:
+        """Arm a confirmation window for an accepted node write.
+
+        Must be called right after a successful ``set_node_status`` /
+        ``set_node_setup``. If no ok frame arrives within
+        ``write_confirm_timeout``, a one-shot GET decides whether the write
+        actually landed: the server acknowledges writes to unreachable
+        nodes without applying them (live finding 2026-09-30), and keeps
+        serving the last-known values, so the GET's contents discriminate
+        "write applied (node alive)" from "write silently dropped (node
+        unreachable)".
+
+        Known limit: a write whose values EQUAL the node's last-known
+        state can only be misreported while the node sits in the
+        server's minutes-long stale-ok window after a power loss (the
+        GET serves ok-marked last-known values); once the server has
+        flipped the node to a lost-marked payload the verdict is
+        Unavailable. Periodic re-checking was deliberately rejected
+        (see api-notes.md).
+
+        If ``unavailable_delay`` is configured shorter than
+        ``write_confirm_timeout``, a lost frame during a pending write
+        can emit a momentary Unavailable before the GET's verdict
+        (correct in outcome).
+
+        ``kind`` is ``"status"`` or ``"setup"`` and selects both the
+        confirming frame type and the discriminating endpoint; anything
+        else raises ``ValueError`` (an unknown kind would otherwise
+        silently behave as ``"status"`` and never verify the real write).
+        Requires a running event loop.
+        """
+        if kind not in ("status", "setup"):
+            msg = f"kind must be 'status' or 'setup', got {kind!r}"
+            raise ValueError(msg)
+        self._ensure_availability_taps()
+        node_type = str(node["type"])
+        addr = int(node["addr"])
+        written = {k: v for k, v in written.items() if v is not None}
+        if not written:
+            # Only-None/no-op write: nothing to discriminate on — the GET
+            # check below would return "applied" unconditionally, dead node
+            # included. Leave any prior confirmation for this node running.
+            return
+        key = (node_type, addr, kind)
+        if (
+            old := self._pending_confirms.pop(key, None)
+        ) is not None and old.task is not None:
+            old.task.cancel()
+        pending = _PendingWrite(
+            node=dict(node),  # snapshot: caller may mutate its dict
+            written=written,
+            kind=kind,
+        )
+        self._pending_confirms[key] = pending
+        pending.task = asyncio.get_running_loop().create_task(
+            self._write_confirm_expired(pending),
+        )
+
+    def _ensure_availability_taps(self) -> None:
+        """Register the internal node status/setup frame taps once."""
+        if self._availability_taps_registered:
+            return
+        self._availability_taps_registered = True
+        # Both subscription helpers deliver (node_type, addr, data) —
+        # register the shared frame handler directly.
+        self.subscribe_to_node_status(self._availability_frame)
+        self.subscribe_to_node_setup(self._availability_frame)
+
+    def _availability_frame(
+        self, node_type: str, addr: int, data: dict[str, Any]
+    ) -> None:
+        """Process one node status/setup frame for availability."""
+        if data.get("sync_status", "ok") == "ok":
+            # Cancels pending confirmations for BOTH kinds — deliberate,
+            # not keyed by frame kind: the ok frame itself reports the
+            # node Available, the same verdict a surviving discriminator
+            # GET would reach on an alive node; and on a dead node no ok
+            # frames arrive at all (writes get no device ack, no stale-ok
+            # pushes observed), so a setup GET that needs to run is never
+            # disturbed by one.
+            self._cancel_node_timers(node_type, addr)
+            self._emit_availability(node_type, addr, available=True)
+        # A bare ``{"sync_status": "lost"}`` frame is ambiguous while a
+        # write confirmation is pending (transient post-write frame):
+        # the pending window decides. With no write in flight it means
+        # the server considers the node unreachable — but still give
+        # the node ``unavailable_delay`` seconds to produce an ok
+        # frame, so a foreign client's transient frame cannot flip a
+        # live node.
+        elif (
+            data.get("sync_status", "ok") == "lost"
+            and (node_type, addr) not in self._lost_timers
+        ):
+            # Only "lost" is evidence of lost; an unknown future
+            # sync_status value degrades to no-change (same no-evidence
+            # rule as the confirm path).
+            self._arm_lost_timer(node_type, addr)
+
+    def _arm_lost_timer(self, node_type: str, addr: int) -> None:
+        if (old := self._lost_timers.get((node_type, addr))) is not None:
+            # Arm replaces: today nothing bypasses the absent-key guard in
+            # _availability_frame, but a future call path must not leak a
+            # live timer task under an overwritten key.
+            old.cancel()
+        self._lost_timers[(node_type, addr)] = (
+            asyncio.get_running_loop().create_task(
+                self._lost_timer_expired(node_type, addr),
+            )
+        )
+
+    def _cancel_lost_timer(self, node_type: str, addr: int) -> None:
+        if (
+            timer := self._lost_timers.pop((node_type, addr), None)
+        ) is not None:
+            timer.cancel()
+
+    def _cancel_node_timers(self, node_type: str, addr: int) -> None:
+        self._cancel_lost_timer(node_type, addr)
+        for key in [
+            k
+            for k in self._pending_confirms
+            if k[0] == node_type and k[1] == addr
+        ]:
+            pending = self._pending_confirms.pop(key)
+            if pending.task is not None:
+                pending.task.cancel()
+
+    def _retire_pending(self, pending: _PendingWrite) -> None:
+        """Remove a confirmation whose task has finished without a verdict.
+
+        Ownership-checked: never touches a newer re-armed confirmation
+        under the same key, so the dict keeps meaning "currently armed".
+        """
+        node = pending.node
+        key = (str(node["type"]), int(node["addr"]), pending.kind)
+        if self._pending_confirms.get(key) is pending:
+            del self._pending_confirms[key]
+
+    async def _lost_timer_expired(self, node_type: str, addr: int) -> None:
+        await asyncio.sleep(self._unavailable_delay)
+        if (
+            self._lost_timers.get((node_type, addr))
+            is not asyncio.current_task()
+        ):
+            # Cancelled/replaced and the key is already gone — not ours to
+            # decide (same ownership convention as the confirm verdict).
+            return
+        self._lost_timers.pop((node_type, addr), None)
+        self._emit_availability(node_type, addr, available=False)
+
+    async def _write_confirm_expired(self, pending: _PendingWrite) -> None:
+        await asyncio.sleep(self._write_confirm_timeout)
+        node = pending.node
+        node_type = str(node["type"])
+        addr = int(node["addr"])
+        actual: Any
+        try:
+            if pending.kind == "setup":
+                actual = await self._session.get_node_setup(
+                    self._device_id,
+                    node,
+                )
+            else:
+                actual = await self._session.get_node_status(
+                    self._device_id,
+                    node,
+                )
+        except SmartboxValidationError as err:
+            self._retire_pending(pending)
+            payload = getattr(err, "payload", None)
+            if (
+                isinstance(payload, dict)
+                and payload.get("sync_status") == "lost"
+            ):
+                # Typed mode: the dead node's status GET returns the bare
+                # lost payload, which FAILS NodeStatus validation -
+                # the payload IS the verdict (documented dead-node wire
+                # shape), not API trouble.
+                self._emit_availability(node_type, addr, available=False)
+                return
+            # Any other validation drift is not node death: no evidence.
+            _LOGGER.warning(
+                "Write confirmation check for %s/%s failed: %r",
+                node_type,
+                addr,
+                err,
+            )
+            return
+        except (SmartboxError, APIUnavailableError) as err:
+            # No evidence either way (API trouble is not node death) —
+            # leave the current state untouched; the next write re-arms.
+            _LOGGER.warning(
+                "Write confirmation check for %s/%s failed: %r",
+                node_type,
+                addr,
+                err,
+            )
+            self._retire_pending(pending)
+            return
+        except Exception as err:  # noqa: BLE001
+            # Node.model_validate on a malformed node dict, transport
+            # timeouts, etc. must not die un-retrieved in this task (same
+            # isolation convention as the callbacks above). No evidence —
+            # leave the state untouched.
+            _LOGGER.warning(
+                "Write confirmation check for %s/%s failed unexpectedly: %r",
+                node_type,
+                addr,
+                err,
+            )
+            self._retire_pending(pending)
+            return
+        if isinstance(actual, BaseModel):
+            # Typed mode (raw_response=False): the confirming GET returns a
+            # pydantic model, not the wire dict raw mode delivers. Adapt it
+            # or the discriminator below would reject every model — alive
+            # nodes' verdicts inverted to "not applied".
+            actual = actual.model_dump()
+        if self._pending_confirms.get((node_type, addr, pending.kind)) is not (
+            pending
+        ):
+            # Replaced by a newer write (which cancels this task — this is
+            # defense-in-depth for the window between the GET resolving and
+            # the emit): the newer confirmation owns the verdict.
+            return
+        del self._pending_confirms[(node_type, addr, pending.kind)]
+        if _written_applied(pending.written, actual):
+            # The GET proved the node alive — a lost frame may still sit in
+            # its grace window (e.g. the transient/foreign push whose ok
+            # never came, which is why this GET ran at all). The verdict
+            # owns the state: cancel the timer before emitting True.
+            self._cancel_lost_timer(node_type, addr)
+            self._emit_availability(node_type, addr, available=True)
+        else:
+            self._emit_availability(node_type, addr, available=False)
+
+    def _emit_availability(
+        self,
+        node_type: str,
+        addr: int,
+        *,
+        available: bool,
+    ) -> None:
+        """Emit availability, deduplicated per node."""
+        key = (node_type, addr)
+        if self._node_availability.get(key) == available:
+            return
+        self._node_availability[key] = available
+        _LOGGER.debug("Node %s/%s availability: %s", node_type, addr, available)
+        for callback in list(self._availability_callbacks):
+            try:
+                callback(node_type, addr, available)
+            except Exception:
+                _LOGGER.exception(
+                    "Error in availability callback for %s/%s",
+                    node_type,
+                    addr,
+                )
+
     def _dev_data_cb(self, data: dict[str, Any]) -> None:
         for sub in self._dev_data_subscriptions:
             sub.match(data)
@@ -377,3 +726,39 @@ class UpdateManager:
                 matched = True
         if not matched:
             _LOGGER.debug("No matches for update %s", data)
+
+
+def _written_applied(written: dict[str, Any], actual: Any) -> bool:  # noqa: ANN401
+    """Check whether the GET result contains everything that was written.
+
+    Deliberately loose: values may be numeric strings with differing
+    precision ("20.0" vs "20.00"), so equality falls back to a numeric
+    comparison; an explicit JSON null in the response counts as a missing
+    key, and 0 == False compares equal. Tight enough for the htr/acm
+    status/setup field domain the feature is used on. A payload marked
+    sync_status "lost" matches nothing - the server is reporting the node
+    unreachable, so nothing in it can evidence an applied write (dead-node
+    /setup GETs keep the full field set with a lost marker).
+    """
+    if not isinstance(actual, dict):
+        return False
+    if actual.get("sync_status") == "lost":
+        # The server explicitly reports the node unreachable: nothing in
+        # this payload can evidence an applied write, not even values
+        # matching the last-known state (dead-node /setup GETs keep the
+        # full field set with a lost marker).
+        return False
+    for key, value in written.items():
+        actual_value = actual.get(key)
+        if actual_value is None:
+            return False
+        if actual_value == value:
+            continue
+        try:
+            if abs(float(value) - float(actual_value)) < _FLOAT_EPSILON:
+                continue
+        except TypeError, ValueError:
+            return False
+        # Numeric comparison said "different".
+        return False
+    return True

@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.6.1
+
+### Features
+* Node reachability / write-confirmation tracking on `UpdateManager`:
+  `subscribe_to_node_availability` / `get_node_availability` report a
+  node Available/Unavailable from its status/setup frames — a bare
+  `{"sync_status": "lost"}` frame arms a uniform 6 s grace timer
+  (`unavailable_delay` knob, matches the vendor app's unreachable
+  window); any ok frame reports Available again. `expect_write_confirmation`
+  (knob `write_confirm_timeout`, 6 s) arms a window after an accepted
+  write: if no ok frame arrives, a one-shot discriminating GET decides
+  "applied (node alive)" vs "silently dropped (node unreachable)" —
+  writes to unreachable nodes are ACKed OK with no device ack (observed
+  live). Frame taps register lazily; both features share them, each
+  enables them independently. Backed by live probes 2026-09-26/30
+  (api-notes.md, "Node reachability").
+
 ## 2.6.0
 
 ### Features
