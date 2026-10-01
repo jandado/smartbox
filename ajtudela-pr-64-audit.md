@@ -466,7 +466,9 @@ commit):
   paths; malformed-wire branch stays `ClickException`
 - #1 `5618aa3` → `64ce646` raw internal read in `set_node_setup`
   (typed-mode device-wipe bug fixed; setup models left untouched —
-  `extra="allow"` remains an open option)
+  `extra="allow"` remains an open option) — follow-up completed by
+  `f66860d`: `extra="allow"` on both setup models, typed round-trips
+  lossless, setup/status asymmetry documented in the docstrings
 - #5 `62efcf8` → `d6c2791` common `SmartboxError` root; 403 data-path
   divergence kept deliberately; `APIUnavailableError` keeps the aiohttp base
 - #9 `da3bb9c` → `9683f4d` dependency majors pinned (`aiohttp`, `pydantic`,
