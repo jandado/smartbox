@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Features
+* CLI: every authentication option also resolves from a `SMARTBOX_*`
+  environment variable, and the `smartbox` console script loads a `.env`
+  file (searched upward from the working directory) before parsing
+  options. Precedence: command line > shell environment > `.env`. See
+  `.env.example`.
+
+### Refactor
+* `UpdateManager`: `subscribe_to_node_status`/`_setup`/`_version`/`_prog`
+  share one `_subscribe_to_node_key` implementation.
+
+### Tests & CI
+* Socket tests for the namespace callbacks, websocket cleanup, SIGINT
+  handler and cancellation during connect; coverage floor of 95%
+  (`fail_under`) enforced.
+* ruff and mypy run over `tests/` in CI; `socket.py` is no longer
+  excluded from codecov.
+
+### Docs
+* README rewritten: library usage, command table, `.env` section and an
+  actionable Support section. api-notes documents how to capture the
+  Basic Auth credential and the new-reseller issue template points to it.
+
 ## 2.6.2
 
 Port round of upstream PR #64 (ajtudela, `improvements/fix_bugs`, 19
