@@ -288,23 +288,28 @@ class UpdateManager:
             lambda p: callback(int(p)),
         )
 
-    def subscribe_to_node_status(
+    def _subscribe_to_node_key(
         self,
+        key: str,
         callback: Callable[[str, int, dict[str, Any]], None],
     ) -> None:
-        """Subscribe to node status updates."""
+        """Subscribe to one per-node resource (``status``, ``setup``, ...).
+
+        Covers both the initial ``dev_data`` snapshot and the incremental
+        ``update`` messages for ``/<node_type>/<addr>/<key>``.
+        """
 
         def dev_data_wrapper(data: dict[str, Any]) -> None:
-            status = data.get("status")
-            if status is None:
-                # jq's {addr, type, status} emits status: null for nodes
+            value = data.get(key)
+            if value is None:
+                # jq's {addr, type, <key>} emits <key>: null for nodes
                 # that don't carry the key — nothing to report.
-                _LOGGER.debug("Status absent in dev data node, ignoring")
+                _LOGGER.debug("%s absent in dev data node, ignoring", key)
                 return
-            callback(data["type"], int(data["addr"]), status)
+            callback(data["type"], int(data["addr"]), value)
 
         self.subscribe_to_dev_data(
-            "(.nodes[] | {addr, type, status})?",
+            f"(.nodes[] | {{addr, type, {key}}})?",
             dev_data_wrapper,
         )
 
@@ -316,109 +321,38 @@ class UpdateManager:
             callback(node_type, int(addr), data)
 
         self.subscribe_to_updates(
-            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/status$",
+            rf"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/{key}$",
             self.BODY_PATH,
             update_wrapper,
         )
+
+    def subscribe_to_node_status(
+        self,
+        callback: Callable[[str, int, dict[str, Any]], None],
+    ) -> None:
+        """Subscribe to node status updates."""
+        self._subscribe_to_node_key("status", callback)
 
     def subscribe_to_node_setup(
         self,
         callback: Callable[[str, int, dict[str, Any]], None],
     ) -> None:
         """Subscribe to node setup updates."""
-
-        def dev_data_wrapper(data: dict[str, Any]) -> None:
-            setup = data.get("setup")
-            if setup is None:
-                # jq's {addr, type, setup} emits setup: null for nodes
-                # that don't carry the key — nothing to report.
-                _LOGGER.debug("Setup absent in dev data node, ignoring")
-                return
-            callback(data["type"], int(data["addr"]), setup)
-
-        self.subscribe_to_dev_data(
-            "(.nodes[] | {addr, type, setup})?",
-            dev_data_wrapper,
-        )
-
-        def update_wrapper(
-            data: dict[str, Any],
-            node_type: str,
-            addr: str,
-        ) -> None:
-            callback(node_type, int(addr), data)
-
-        self.subscribe_to_updates(
-            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/setup$",
-            self.BODY_PATH,
-            update_wrapper,
-        )
+        self._subscribe_to_node_key("setup", callback)
 
     def subscribe_to_node_version(
         self,
         callback: Callable[[str, int, dict[str, Any]], None],
     ) -> None:
         """Subscribe to node version updates."""
-
-        def dev_data_wrapper(data: dict[str, Any]) -> None:
-            version = data.get("version")
-            if version is None:
-                # jq's {addr, type, version} emits version: null for nodes
-                # that don't carry the key — nothing to report.
-                _LOGGER.debug("Version absent in dev data node, ignoring")
-                return
-            callback(data["type"], int(data["addr"]), version)
-
-        self.subscribe_to_dev_data(
-            "(.nodes[] | {addr, type, version})?",
-            dev_data_wrapper,
-        )
-
-        def update_wrapper(
-            data: dict[str, Any],
-            node_type: str,
-            addr: str,
-        ) -> None:
-            callback(node_type, int(addr), data)
-
-        self.subscribe_to_updates(
-            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/version$",
-            self.BODY_PATH,
-            update_wrapper,
-        )
+        self._subscribe_to_node_key("version", callback)
 
     def subscribe_to_node_prog(
         self,
         callback: Callable[[str, int, dict[str, Any]], None],
     ) -> None:
         """Subscribe to node prog (schedule) updates."""
-
-        def dev_data_wrapper(data: dict[str, Any]) -> None:
-            prog = data.get("prog")
-            if prog is None:
-                # jq's {addr, type, prog} emits prog: null for nodes
-                # that don't carry the key — nothing to report.
-                _LOGGER.debug("Prog absent in dev data node, ignoring")
-                return
-            callback(data["type"], int(data["addr"]), prog)
-
-        self.subscribe_to_dev_data(
-            "(.nodes[] | {addr, type, prog})?",
-            dev_data_wrapper,
-        )
-
-        def update_wrapper(
-            data: dict[str, Any],
-            node_type: str,
-            addr: str,
-        ) -> None:
-            callback(node_type, int(addr), data)
-
-        self.subscribe_to_updates(
-            r"^/(?P<node_type>[^/]+)/(?P<addr>\d+)/prog$",
-            self.BODY_PATH,
-            update_wrapper,
-        )
+        self._subscribe_to_node_key("prog", callback)
 
     def subscribe_to_node_availability(
         self,
