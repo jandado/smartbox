@@ -1,5 +1,52 @@
 # Changelog
 
+## 2.6.2
+
+Port round of upstream PR #64 (ajtudela, `improvements/fix_bugs`, 19
+commits) — full per-commit audit, verdicts and evidence in
+ajtudela-pr-64-audit.md. Ten commits were already fixed by the 2.6.x
+round (independent convergence); of the remainder, seven were ported
+(each commit references the upstream source hash), one was declined by
+decision (#7: typed-mode sparse statuses keep the rich
+`SmartboxValidationError` rejection — the bare `{"sync_status": "lost"}`
+dead-node frame is first-class there), and one is upstream-only (#18,
+version bump).
+
+### Bug Fixes
+* `set_node_setup` never serializes the read-modify-write GET through
+  the Pydantic models: the internal read is always raw, so keys the
+  setup models do not declare (e.g. `counter_offset` on pmo nodes) can
+  no longer be wiped on the device by a setup write (upstream `5618aa3`).
+  Completed by `extra="allow"` on `DefaultNodeSetup`/`PmoSetup`, so
+  typed (`raw_response=False`) reads keep unknown keys and round-trip
+  losslessly (upstream `5618aa3`, completion by decision).
+* `InvalidAuthError`, `APIUnavailableError` and `ResellerNotExistError`
+  now derive from `SmartboxError` — one `except SmartboxError` catches
+  every library failure. `APIUnavailableError` keeps its
+  `aiohttp.ClientConnectionError` base for backwards compatibility; the
+  data-path 403 → `SmartboxError` mapping is kept deliberately
+  (upstream `62efcf8`).
+* CLI: unknown `-d`/`-n` values raise `click.BadParameter` with a
+  `param_hint` (exit code 2, usage line, offending option named)
+  instead of `ClickException`; malformed wire node payloads stay
+  `ClickException` (upstream `6ad2014`).
+
+### Build & Docs
+* Core dependencies bounded to their current major: `aiohttp>=3,<4`,
+  `pydantic>=2,<3`, `python-socketio>=5,<6` (upstream `da3bb9c`; the
+  commit's unused-dependency removal was already done in 2.6.0).
+* `.vscode/settings.json`: pylint/flake8 editor settings replaced with
+  the ruff formatter/code-actions setup (upstream `a78bc3a`; its
+  pyproject/ruff halves were already done in 2.6.0).
+* CODEOWNERS co-owner and README badge reflow adopted from upstream
+  `2ec1ef0`.
+
+### Tests
+* `test_all_resellers` (real HTTP calls to twelve reseller servers)
+  moved behind a `network` marker, deselected by default; run on demand
+  with `pytest -m network`. Sessions in it are closed (upstream
+  `0bef64c`).
+
 ## 2.6.1
 
 ### Features

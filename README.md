@@ -7,9 +7,6 @@
 
 Python API to control heating 'smart boxes'
 
-
-## Installation
-
 ## Install
 
 To install smartbox simply run:
@@ -38,9 +35,9 @@ Verbose logging can be enabled with the `-v`/`--verbose` flag.
 ### Optional options
 These options are useful if your reseller is not configured.
 
-* `-b`/`--base-auth-creds`: An HTTP Basic Auth credential used to do initial
+* `-b`/`--basic-auth-creds`: An HTTP Basic Auth credential used to do initial
   authentication with the server. Use the base64 encoded string directly. See
-  'Basic Auth Credential' section below for more details.
+  'Basic Auth Credential' in [api-notes.md](./api-notes.md) for more details.
 * `-a`/`--api-name`: The API name for your heater vendor. This is visible in
   the 'API Host' entry in the 'Version' menu item in the mobile app/web app. If
   the host name is of the form `api-foo.xxxx` or `api.xxxx` use the values
@@ -143,7 +140,7 @@ See [api-notes.md](./api-notes.md) for notes on REST and socket.io endpoints.
 Prerequisites:
 
     uv
-    python >=3.13
+    python >=3.14.2
 
 Clone the repo, install dependencies and install pre-commit hooks:
 
@@ -172,7 +169,7 @@ Another way to run the tests is by using `tox`. This runs the tests against the 
 
 or by specifying a python version
 
-    tox -e py313
+    tox -e py314
 
 # Support
 [![Buy a coffee to ajtudela][buymeacoffee-shield]][buymeacoffee-ajtudela]
