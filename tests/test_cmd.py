@@ -101,6 +101,61 @@ async def test_socket(runner, mocker, mock_session):
 
 
 @pytest.mark.asyncio
+async def test_set_status_unknown_device_reports_bad_parameter(
+    runner, mock_session
+):
+    """An unknown -d must give a usage error (exit 2), not a traceback.
+
+    Regression pin for the BadParameter classification: click renders the
+    usage line and exits 2 for parameter misuse, 1 for runtime failure.
+    """
+    devices_future = asyncio.Future()
+    devices_future.set_result([{"name": "Device1", "dev_id": "1"}])
+    mock_session.return_value.get_devices.return_value = devices_future
+
+    result = await runner.invoke(
+        smartbox,
+        [*DEFAULT_ARGS, "set-status", "-d", "does-not-exist", "-n", "1"],
+    )
+
+    assert result.exit_code == 2
+    assert "does-not-exist" in result.output
+    assert "--device-id" in result.output
+    mock_session.return_value.set_node_status.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_status_unknown_node_reports_bad_parameter(
+    runner, mock_session
+):
+    """An unknown -n must give a usage error (exit 2), not a traceback."""
+    devices_future = asyncio.Future()
+    devices_future.set_result([{"name": "Device1", "dev_id": "1"}])
+    mock_session.return_value.get_devices.return_value = devices_future
+
+    nodes_future = asyncio.Future()
+    nodes_future.set_result([{"name": "Node1", "addr": 1}])
+    mock_session.return_value.get_nodes.return_value = nodes_future
+
+    result = await runner.invoke(
+        smartbox,
+        [
+            *DEFAULT_ARGS,
+            "set-status",
+            "-d",
+            "1",
+            "-n",
+            "999",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "999" in result.output
+    assert "--node-addr" in result.output
+    mock_session.return_value.set_node_status.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_set_status(runner, mock_session):
     devices_future = asyncio.Future()
     devices_future.set_result([{"name": "Device1", "dev_id": "1"}])

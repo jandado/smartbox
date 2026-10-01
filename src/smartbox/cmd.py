@@ -27,7 +27,7 @@ async def _resolve_device(
     device = next((d for d in devices if d["dev_id"] == device_id), None)
     if device is None:
         msg = f"no device with dev_id {device_id!r}"
-        raise click.ClickException(msg)
+        raise click.BadParameter(msg, param_hint="'-d/--device-id'")
     return device
 
 
@@ -56,7 +56,7 @@ async def _resolve_node(
     node = next((n for n in nodes if _wire_addr(n) == node_addr), None)
     if node is None:
         msg = f"no node with addr {node_addr} on device {device_id!r}"
-        raise click.ClickException(msg)
+        raise click.BadParameter(msg, param_hint="'-n/--node-addr'")
     return node
 
 
