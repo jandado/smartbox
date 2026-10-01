@@ -26,7 +26,7 @@
 | 4 | `cdec9dc` | `__aexit__` closes a caller-injected `ClientSession` | Fixed directly | Skip |
 | 5 | `62efcf8` | No common error root; 401/403 unmapped on data path | Partially: 401 done; 403 deliberately different; common root **open** | Port the common root on our terms |
 | 6 | `0bef64c` | `test_all_resellers` hits 12 real servers in CI, leaks sessions | **Still applies** | Port (applies cleanly) |
-| 7 | `6d592bf` | `DefaultNodeStatus` rejects sparse payloads in typed mode | Partially applies (typed mode only) | Decision: degrade vs our rich-error rejection |
+| 7 | `6d592bf` | `DefaultNodeStatus` rejects sparse payloads in typed mode | DECIDED (2026-10-01): keep our rich-error rejection | No port |
 | 8 | `23b9368` | `_dev_data` emits on a disconnected namespace (missing `return`) | Fixed directly | Skip |
 | 9 | `da3bb9c` | Unused runtime deps; unbounded dependency ranges | Partially: unused deps already dropped; **pinning open** | Optional: pin majors |
 | 10 | `db7c766` | No HTTP timeout (aiohttp 5-min default) | Fixed directly (richer) | Skip |
@@ -200,16 +200,31 @@ much better failure surface than the PR started from. Our default is
 `raw_response=True` and the HA integration uses raw mode, so the HA surface
 is unaffected either way.
 
-**Verdict: partially applies (typed mode only).** This is a **design
-decision**, not a clear bug fix for us: the PR chooses "degrade silently",
-ours chooses "reject with full payload evidence". If we keep typed mode as a
-supported surface we may prefer our richer failure; the PR is right that the
-current all-required fallback is brittle. Related but separate: our
-`NodeStatus` docstring (`models.py:182-196`) documents the adjacent quirk that
-*partial* frames degrade into `HtrNodeStatus` and silently drop htr_mod
-extras — a full `extra="allow"` fallback model would interact with that union
-behavior, so any port must re-verify union resolution (tests/fixtures/live
-cover these shapes).
+**Verdict: partially applies (typed mode only).** DECIDED (2026-10-01):
+**keep our rich-error rejection; no port.** Rationale from the decision
+discussion:
+
+- The bare `{"sync_status": "lost"}` offline-node frame (api-notes.md
+  "Offline node's /status GET eventually returns a BARE ... payload",
+  fixture `tests/fixtures/live/socket_update_sync_lost_frame.json`) is the
+  one legitimate sparse payload on the wire — and our typed-mode design
+  already routes it first-class: the `SmartboxValidationError` docstring
+  (`error.py:8-18`) names it explicitly; consumers catch the error and
+  inspect `payload["sync_status"] == "lost"`.
+- Upstream's degrade-to-None-object hides genuine wire drift (which our
+  2.6.x probes showed is common across firmware families) and forces
+  consumers to None-check every typed attribute; a failure surfaces far
+  from its cause.
+- Our own sparse handling (UpdateManager availability, the integration)
+  runs entirely in raw mode, where the frame passes through untouched;
+  typed-mode rejection affects only explicit typed consumers.
+
+Related but separate: our `NodeStatus` docstring (`models.py:182-196`)
+documents the adjacent quirk that *partial* frames degrade into
+`HtrNodeStatus` and silently drop htr_mod extras — upstream's change would
+not have fixed that either (its type-specific fields stay required); it
+remains a possible future improvement with its own union-resolution
+analysis (tests/fixtures/live cover the shapes).
 
 ### 8. `23b9368` fix(socket): stop emitting dev_data on a disconnected namespace
 
@@ -439,24 +454,42 @@ change does not conflict with our own, even for pure cosmetics.
    Python 3 (the exception spec is the bare tuple) but obscure; parenthesize
    on the next touch of that function.
 
+## Resolution log (2026-10-01)
+
+All 19 commits resolved. Ported (commit message references the source
+commit):
+
+- #6 `0bef64c` → `c99884e` network marker + session cleanup for
+  `test_all_resellers`
+- #19 `2ec1ef0` → `1122305` CODEOWNERS + README hunks adopted verbatim
+- #13 `6ad2014` → `838abcf` `BadParameter` + `param_hint` for the not-found
+  paths; malformed-wire branch stays `ClickException`
+- #1 `5618aa3` → `64ce646` raw internal read in `set_node_setup`
+  (typed-mode device-wipe bug fixed; setup models left untouched —
+  `extra="allow"` remains an open option)
+- #5 `62efcf8` → `d6c2791` common `SmartboxError` root; 403 data-path
+  divergence kept deliberately; `APIUnavailableError` keeps the aiohttp base
+- #9 `da3bb9c` → `9683f4d` dependency majors pinned (`aiohttp`, `pydantic`,
+  `python-socketio`); the unused-deps half was already ours
+- #17 `a78bc3a` → `1b1d112` `.vscode` ruff setup (pyproject/ruff halves were
+  already ours)
+
+Declined, by decision:
+
+- #7 `6d592bf` — keep our rich-error rejection in typed mode (bare-lost
+  frame is first-class in our design; see its section)
+
+The other 11 commits were already fixed directly by our 2.6.x round (#2, #3,
+#4, #8, #10, #11, #12, #14, #15, #16) or are upstream-only (#18 version bump).
+
+Verification per port: full suite, ruff, mypy, ruff format; the
+integration contract suite (tests/test_lib_contract.py, 8 tests) re-run
+green against the linked dev lib after every lib-surface change.
+
 ## Decision handoff
 
-Two commits are worth acting on (#1 port, #6 port), one is a design decision
-(#7), one is a small gap (#5 common root), and two are optional hygiene (#9
-pinning, #17 .vscode). For #13 the classification detail is DECIDED
-(`BadParameter` for the not-found paths, `param_hint` included; malformed
-wire payloads stay `ClickException`) — see its section for implementation
-notes. For #19 the decision is to stay in sync with upstream on the
-CODEOWNERS and README changes and skip the api-notes reflow. The remaining 10
-commits document that our 2.6.x round independently fixed the same defects —
-useful as evidence when discussing PR #64 upstream.
-
-Suggested resolution order (dependencies, easiest-first within risk):
-#13 (small, isolated, decided) → #6 (applies cleanly) → #19 (adopt the two
-conflict-free doc hunks) → #1 (session bug) → #7 (design decision) → #5
-(common root; run contract tests) → #9, #17 (hygiene, whenever convenient).
-
-General rule for the whole audit: wherever a PR change does not conflict with
-our own work, prefer adopting it verbatim — the point of this fork's effort
-is to keep ajtudela's eventual merge of all upstream work as frictionless as
-possible.
+Superseded by the Resolution log above — kept for the discussion history
+that led there. The standing rule remains: wherever a PR change does not
+conflict with our own work, prefer adopting it verbatim — the point of this
+fork's effort is to keep ajtudela's eventual merge of all upstream work as
+frictionless as possible.
