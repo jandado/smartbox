@@ -499,3 +499,175 @@ async def test_bad_namespace_error_on_connect_is_not_fatal(socket_session):
         side_effect=socketio.exceptions.BadNamespaceError("no ns")
     )
     assert await socket_session._attempt_connection("http://host") is False
+
+
+@pytest.mark.asyncio
+async def test_namespace_connect_and_disconnect_track_state(socket_session):
+    """on_connect/on_disconnect drive ``connected`` and reset the flags."""
+    ns = socket_session.namespace
+    assert ns.connected is False
+    await ns.on_connect()
+    assert ns.connected is True
+    ns._received_message = True
+    ns._received_dev_data = True
+    await ns.on_disconnect("transport close")
+    assert ns.connected is False
+    assert ns._received_message is False
+    assert ns._received_dev_data is False
+
+
+@pytest.mark.asyncio
+async def test_namespace_dev_data_invokes_callback(socket_session):
+    """dev_data marks the namespace ready and forwards the payload."""
+    callback = MagicMock()
+    ns = socket_module_namespace(socket_session, dev_data_callback=callback)
+    await ns.on_dev_data({"nodes": []})
+    callback.assert_called_once_with({"nodes": []})
+    assert ns._received_dev_data is True
+
+
+@pytest.mark.asyncio
+async def test_namespace_dev_data_without_callback_is_ok(socket_session):
+    ns = socket_module_namespace(socket_session)
+    await ns.on_dev_data({"nodes": []})
+    assert ns._received_message is True
+
+
+@pytest.mark.asyncio
+async def test_namespace_first_update_requests_dev_data(socket_session):
+    """The first update triggers the dev_data request and is then dropped."""
+    callback = MagicMock()
+    ns = socket_module_namespace(socket_session, node_update_callback=callback)
+    ns.emit = AsyncMock()
+    await ns.on_update({"path": "/htr/1/status"})
+    ns.emit.assert_awaited_once_with("dev_data", namespace=ns._namespace)
+    callback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_namespace_update_forwarded_after_dev_data(socket_session):
+    callback = MagicMock()
+    ns = socket_module_namespace(socket_session, node_update_callback=callback)
+    await ns.on_dev_data({})
+    await ns.on_update({"path": "/htr/1/status"})
+    callback.assert_called_once_with({"path": "/htr/1/status"})
+
+
+def socket_module_namespace(socket_session, **callbacks):
+    return socket_mod.SmartboxAPIV2Namespace(
+        socket_session._session, "/api/v2/socket_io", **callbacks
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_websocket_closes_open_ws(socket_session):
+    ws = MagicMock(closed=False)
+    ws.close = AsyncMock()
+    socket_session._sio.eio.ws = ws
+    await socket_session._cleanup_websocket()
+    ws.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_websocket_skips_closed_ws(socket_session):
+    ws = MagicMock(closed=True)
+    ws.close = AsyncMock()
+    socket_session._sio.eio.ws = ws
+    await socket_session._cleanup_websocket()
+    ws.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_websocket_swallows_close_errors(socket_session):
+    ws = MagicMock(closed=False)
+    ws.close = AsyncMock(side_effect=OSError("boom"))
+    socket_session._sio.eio.ws = ws
+    await socket_session._cleanup_websocket()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_disconnect_now_swallows_oserror(socket_session):
+    socket_session._sio.disconnect = AsyncMock(side_effect=OSError("boom"))
+    await socket_session._disconnect_now()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_remove_sigint_handler_tolerates_failure(socket_session):
+    loop = MagicMock()
+    loop.remove_signal_handler.side_effect = ValueError("bad")
+    socket_session._sigint_loop = loop
+    socket_session._remove_sigint_handler()
+    assert socket_session._sigint_loop is None
+
+
+@pytest.mark.asyncio
+async def test_connect_event_installs_sigint_handler_that_cancels(
+    socket_session, mocker
+):
+    """The installed SIGINT callback schedules cancel() as a tracked task."""
+    session = AsyncSmartboxSession(
+        api_name="test_api",
+        username="test_user",
+        password="test_password",
+    )
+    ss = SocketSession(session, "device_id", add_sigint_handler=True)
+    try:
+        ss.cancel = AsyncMock()
+        connect_cb = ss._sio.event.call_args[0][0]
+        mock_loop = MagicMock()
+        mocker.patch("asyncio.get_running_loop", return_value=mock_loop)
+        await connect_cb()
+        handler = mock_loop.add_signal_handler.call_args[0][1]
+        handler()
+        (task,) = ss._background_tasks
+        await task
+        ss.cancel.assert_awaited_once()
+        assert not ss._background_tasks
+        assert ss._sigint_loop is mock_loop
+    finally:
+        await session.aclose_owned_session()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_connect_schedules_cleanup(socket_session):
+    """A cancel mid-connect disconnects the dangling socket once it lands."""
+    release = asyncio.Event()
+
+    async def slow_connect(*args, **kwargs):
+        await release.wait()
+
+    socket_session._sio.connect = slow_connect
+    socket_session._sio.disconnect = AsyncMock()
+    attempt = asyncio.create_task(
+        socket_session._attempt_connection("wss://example/socket")
+    )
+    await asyncio.sleep(0)
+    attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await attempt
+    (cleanup,) = socket_session._background_tasks
+    release.set()
+    await cleanup
+    socket_session._sio.disconnect.assert_awaited_once()
+    assert not socket_session._background_tasks
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_connect_cleanup_swallows_errors(socket_session):
+    release = asyncio.Event()
+
+    async def slow_connect(*args, **kwargs):
+        await release.wait()
+
+    socket_session._sio.connect = slow_connect
+    socket_session._sio.disconnect = AsyncMock(side_effect=RuntimeError("x"))
+    attempt = asyncio.create_task(
+        socket_session._attempt_connection("wss://example/socket")
+    )
+    await asyncio.sleep(0)
+    attempt.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await attempt
+    (cleanup,) = socket_session._background_tasks
+    release.set()
+    await cleanup  # the RuntimeError must not escape
