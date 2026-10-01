@@ -18,11 +18,11 @@ classifiers = [
 license = "MIT"
 license-files = ["LICEN[CS]E*"]
 dependencies = [
-    "aiohttp",
+    "aiohttp>=3,<4",
     "asyncclick",
     "jq",
-    "pydantic",
-    "python-socketio",
+    "pydantic>=2,<3",
+    "python-socketio>=5,<6",
 ]
 
 [project.urls]

@@ -1191,11 +1191,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp" },
+    { name = "aiohttp", specifier = ">=3,<4" },
     { name = "asyncclick" },
     { name = "jq" },
-    { name = "pydantic" },
-    { name = "python-socketio" },
+    { name = "pydantic", specifier = ">=2,<3" },
+    { name = "python-socketio", specifier = ">=5,<6" },
 ]
 
 [package.metadata.requires-dev]
