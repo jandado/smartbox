@@ -20,6 +20,7 @@ import time_machine
 from smartbox import (
     APIUnavailableError,
     InvalidAuthError,
+    ResellerNotExistError,
     SmartboxError,
     SmartboxValidationError,
 )
@@ -1573,6 +1574,20 @@ async def test_api_request_retries_on_connection_error(async_session):
         result = await async_session._api_request(path)
         assert result == {"ok": 1}
         assert mock_request.call_count == 2
+
+
+def test_error_hierarchy_has_common_root():
+    """Every public error is catchable as ``SmartboxError``.
+
+    ``APIUnavailableError`` keeps the ``aiohttp.ClientConnectionError``
+    base for backwards compatibility (consumers and the token path
+    catch that type directly).
+    """
+    assert issubclass(InvalidAuthError, SmartboxError)
+    assert issubclass(APIUnavailableError, SmartboxError)
+    assert issubclass(ResellerNotExistError, SmartboxError)
+    assert issubclass(SmartboxValidationError, SmartboxError)
+    assert issubclass(APIUnavailableError, aiohttp.ClientConnectionError)
 
 
 @pytest.mark.asyncio

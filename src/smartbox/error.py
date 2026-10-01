@@ -4,7 +4,7 @@ import aiohttp
 
 
 class SmartboxError(Exception):
-    """General errors from smartbox API."""
+    """Base class for every error raised by this library."""
 
 
 class SmartboxValidationError(SmartboxError):
@@ -25,13 +25,17 @@ class SmartboxValidationError(SmartboxError):
         self.payload = payload
 
 
-class InvalidAuthError(Exception):
-    """Authentication failed."""
+class InvalidAuthError(SmartboxError):
+    """Authentication failed (bad credentials or rejected/expired token)."""
 
 
-class APIUnavailableError(aiohttp.ClientConnectionError):
-    """API is unavailable."""
+class APIUnavailableError(SmartboxError, aiohttp.ClientConnectionError):
+    """API is unavailable.
+
+    Also inherits from ``aiohttp.ClientConnectionError`` for backwards
+    compatibility with consumers that catch that type.
+    """
 
 
-class ResellerNotExistError(Exception):
+class ResellerNotExistError(SmartboxError):
     """Reseller is not known."""
