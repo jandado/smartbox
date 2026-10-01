@@ -10,6 +10,7 @@ from smartbox.models import (
     NodeFactoryOptions,
     NodeSetup,
     NodeStatus,
+    PmoSetup,
 )
 
 
@@ -89,6 +90,48 @@ def test_node_setup():
     setup = NodeSetup(**data)
     assert setup.sync_status == "synced"
     assert setup.control_mode == 1
+
+
+def test_node_setup_keeps_unknown_keys():
+    """Unknown keys survive validation and model_dump (extra allow).
+
+    Regression pin for the #1 follow-up (upstream 5618aa3): the setup
+    endpoint requires the full payload to be re-posted, so a typed read
+    must not lose fields our models do not declare.
+    """
+    data = {
+        "sync_status": "synced",
+        "control_mode": 1,
+        "units": "C",
+        "power": "on",
+        "offset": "0.5",
+        "away_mode": 0,
+        "away_offset": "1.0",
+        "modified_auto_span": 10,
+        "window_mode_enabled": True,
+        "true_radiant_enabled": True,
+        "factory_options": {
+            "temp_compensation_enabled": True,
+            "window_mode_available": True,
+            "true_radiant_available": True,
+            "duty_limit": 10,
+        },
+        # Undeclared by both setup models (observed on pmo).
+        "counter_offset": 42,
+    }
+    setup = NodeSetup(**data)
+    assert setup.counter_offset == 42
+    dumped = setup.model_dump(mode="json")
+    assert dumped["counter_offset"] == 42
+
+    pmo_setup = PmoSetup(
+        circuit_type=1,
+        power_limit=0,
+        reverse=False,
+        counter_offset=7,
+    )
+    assert pmo_setup.counter_offset == 7
+    assert pmo_setup.model_dump(mode="json")["counter_offset"] == 7
 
 
 def test_default_node_status():

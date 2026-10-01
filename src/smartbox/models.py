@@ -3,7 +3,7 @@
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, RootModel
+from pydantic import BaseModel, ConfigDict, RootModel
 
 
 class SmartboxNodeType(StrEnum):
@@ -62,6 +62,12 @@ class NodeExtraOptions(BaseModel):
 class PmoSetup(BaseModel):
     """Pmo node setup."""
 
+    # Keep unknown keys: the setup endpoint requires the full payload to
+    # be re-posted, so any field the device returns must survive a
+    # round-trip. Lossless-tolerant by design, unlike the status models
+    # (strict with a rich error for drift) - see DefaultNodeSetup.
+    model_config = ConfigDict(extra="allow")
+
     circuit_type: int
     power_limit: int
     reverse: bool
@@ -73,7 +79,18 @@ class DefaultNodeSetup(BaseModel):
     ``user_duty_factor``/``flash_version``/``extra_options`` are absent on
     the fw-1.9 htr family; ``max_stemp_limit``/``priority``/``revision``
     only appear there.
+
+    Unknown keys are kept (``extra="allow"``): the setup endpoint
+    requires the full payload to be re-posted, so a typed read must not
+    lose fields our models do not declare yet (e.g. ``counter_offset``
+    on pmo nodes) — a consumer replaying the dump into a write would
+    wipe them on the device. Deliberate asymmetry with the status
+    models, which stay strict with a rich error for drift: setup
+    payloads feed destructive full-repost writes where loss matters,
+    statuses are read-only observations where drift is the signal.
     """
+
+    model_config = ConfigDict(extra="allow")
 
     sync_status: str
     control_mode: int
