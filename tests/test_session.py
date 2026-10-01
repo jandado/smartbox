@@ -23,7 +23,7 @@ from smartbox import (
     SmartboxError,
     SmartboxValidationError,
 )
-from smartbox.models import DefaultNodeSetup, NodeSetup
+from smartbox.models import DefaultNodeSetup
 from smartbox.session import (
     _DEFAULT_BACKOFF_FACTOR,
     _DEFAULT_RETRY_ATTEMPTS,
@@ -647,16 +647,23 @@ async def test_set_node_setup(async_smartbox_session):
     with (
         patch.object(
             async_smartbox_session,
-            "get_node_setup",
+            "_api_request",
             new_callable=AsyncMock,
-        ) as mock_get_node_setup,
+        ) as mock_api_request,
         patch.object(
             async_smartbox_session,
             "_api_post",
             new_callable=AsyncMock,
         ) as mock_api_post,
     ):
-        mock_get_node_setup.return_value = {"setting2": "value2"}
+        # The raw setup carries a key the Pydantic models do not declare
+        # (``counter_offset``). It must survive the read-modify-write
+        # cycle and be re-posted unchanged, otherwise it would be wiped
+        # on the device.
+        mock_api_request.return_value = {
+            "setting2": "value2",
+            "counter_offset": 42,
+        }
         mock_api_post.return_value = None
 
         result = await async_smartbox_session.set_node_setup(
@@ -665,49 +672,26 @@ async def test_set_node_setup(async_smartbox_session):
             setup_args=setup_args,
         )
         assert result is None
-        mock_api_post.assert_called_once_with(
-            data={"setting1": "value1", "setting2": "value2"},
-            path=f"devs/{mock_device_id}/{mock_node['type']}/{mock_node['addr']}/setup",
+        setup_path = (
+            f"devs/{mock_device_id}/{mock_node['type']}/"
+            f"{mock_node['addr']}/setup"
         )
-        data = {
-            "sync_status": "synced",
-            "control_mode": 1,
-            "units": "C",
-            "power": "on",
-            "offset": "0.5",
-            "away_mode": 0,
-            "away_offset": "1.0",
-            "modified_auto_span": 10,
-            "window_mode_enabled": True,
-            "true_radiant_enabled": True,
-            "user_duty_factor": 5,
-            "flash_version": "1.0.0",
-            "factory_options": {
-                "temp_compensation_enabled": True,
-                "window_mode_available": True,
-                "true_radiant_available": True,
-                "duty_limit": 10,
-                "boost_config": 1,
-                "button_double_press": True,
-                "prog_resolution": 5,
-                "bbc_value": 2,
-                "bbc_available": True,
-                "lst_value": 3,
-                "lst_available": True,
-                "fil_pilote_available": True,
-                "backlight_time": 30,
-                "button_down_code": 1,
-                "button_up_code": 2,
-                "button_mode_code": 3,
-                "button_prog_code": 4,
-                "button_off_code": 5,
-                "button_boost_code": 6,
-                "splash_screen_type": 1,
+        mock_api_request.assert_awaited_once_with(setup_path)
+        mock_api_post.assert_called_once_with(
+            data={
+                "setting1": "value1",
+                "setting2": "value2",
+                "counter_offset": 42,
             },
-            "extra_options": {"boost_temp": "22.5", "boost_time": 60},
-        }
-        setup = NodeSetup(**data)
-        mock_get_node_setup.return_value = setup
+            path=setup_path,
+        )
+
+        # The internal read stays raw even when the session is in typed
+        # mode: the round-trip must never serialize through the model.
+        mock_api_request.reset_mock()
+        mock_api_post.reset_mock()
+        async_smartbox_session.raw_response = False
+        mock_api_request.return_value = {"counter_offset": 7}
 
         result = await async_smartbox_session.set_node_setup(
             device_id=mock_device_id,
@@ -715,6 +699,11 @@ async def test_set_node_setup(async_smartbox_session):
             setup_args=setup_args,
         )
         assert result is None
+        mock_api_post.assert_called_once_with(
+            data={"setting1": "value1", "counter_offset": 7},
+            path=setup_path,
+        )
+        async_smartbox_session.raw_response = True
 
 
 @pytest.mark.asyncio
