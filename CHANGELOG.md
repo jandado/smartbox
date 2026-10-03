@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.7.0
 
 ### New
 * Per-user `ws_user` websocket transport (`WsUserSocketSession`,
