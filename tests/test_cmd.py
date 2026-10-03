@@ -553,6 +553,40 @@ def test_load_env_file_populates_environment(tmp_path, monkeypatch):
     assert os.environ["SMARTBOX_API_NAME"] == "api-foo"
 
 
+def test_load_env_file_strips_inline_comments(tmp_path, monkeypatch):
+    """Inline comments are cut and quoted values still unquote (dotenv rules).
+
+    A ``#`` starts a comment only when preceded by whitespace and outside
+    quotes: ``a#b`` keeps its hash, ``"a #b"`` keeps its hash, and a
+    quoted value followed by a comment unquotes cleanly. Full-line
+    comments stay safe.
+    """
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    for key in (
+        "SMARTBOX_USERNAME",
+        "SMARTBOX_PASSWORD",
+        "SMARTBOX_API_NAME",
+        "SMARTBOX_OTHER",
+    ):
+        os.environ.pop(key, None)
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "# full-line comment stays safe\n"
+        "SMARTBOX_USERNAME=alice@example.com # my login email\n"
+        'SMARTBOX_PASSWORD="s3cr3t pass" # quoted value with comment\n'
+        'SMARTBOX_API_NAME="api #foo"\n'
+        "SMARTBOX_OTHER=a#b\n",
+        encoding="utf-8",
+    )
+
+    _load_env_file(env_file)
+
+    assert os.environ["SMARTBOX_USERNAME"] == "alice@example.com"
+    assert os.environ["SMARTBOX_PASSWORD"] == "s3cr3t pass"
+    assert os.environ["SMARTBOX_API_NAME"] == "api #foo"
+    assert os.environ["SMARTBOX_OTHER"] == "a#b"
+
+
 def test_load_env_file_does_not_override_existing(tmp_path, monkeypatch):
     """A value already in the environment wins over the file."""
     monkeypatch.setenv("SMARTBOX_USERNAME", "from-shell")

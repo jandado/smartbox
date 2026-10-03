@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 from typing import Any, cast
 
 import asyncclick as click
@@ -37,7 +38,11 @@ def _load_env_file(path: Path) -> None:
     Variables already set in the real environment take precedence, so an
     explicit shell variable still wins over the file. Blank lines, ``#``
     comments and lines without ``=`` are ignored; an optional ``export``
-    prefix is dropped and one pair of surrounding matching quotes is stripped.
+    prefix is dropped. Values follow python-dotenv's parsing: a ``#``
+    starts an inline comment only when it is preceded by whitespace and
+    lies outside a quoted region, and one pair of surrounding matching
+    quotes is stripped — so ``pass="a #b"`` keeps its hash while
+    ``pass="a" # comment`` unquotes cleanly.
     """
     try:
         content = path.read_text(encoding="utf-8")
@@ -51,6 +56,15 @@ def _load_env_file(path: Path) -> None:
             continue
         key, _, value = line.partition("=")
         key = key.removeprefix("export ").strip()
+        value = value.strip()
+        if value[:1] in quotes:
+            # Drop anything after the closing quote (typically a comment);
+            # a ``#`` inside the quoted region belongs to the value.
+            closing = value.find(value[0], 1)
+            if closing != -1:
+                value = value[: closing + 1]
+        else:
+            value = re.split(r"(?<=\s)#", value, maxsplit=1)[0]
         value = value.strip()
         if value[:1] in quotes and value[-1:] == value[:1]:
             value = value[1:-1]

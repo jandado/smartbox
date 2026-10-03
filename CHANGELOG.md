@@ -9,6 +9,14 @@
   options. Precedence: command line > shell environment > `.env`. See
   `.env.example`.
 
+### Fixes
+* CLI: `.env` parsing now follows python-dotenv semantics — an inline
+  `#` starts a comment only when it is preceded by whitespace and lies
+  outside quotes, and quoted values unquote even when a trailing
+  comment follows them. Previously inline comments silently became
+  part of the value and quote-stripping was defeated, corrupting
+  credentials written in the conventional quoted style.
+
 ### Refactor
 * `UpdateManager`: `subscribe_to_node_status`/`_setup`/`_version`/`_prog`
   share one `_subscribe_to_node_key` implementation.
