@@ -2465,6 +2465,14 @@ def test_redacted_url_masks_wifi_password():
     assert "pass=***" in redacted
 
 
+def test_redacted_url_masks_user_id():
+    url = "https://api.helki.com/api/v2/ws_user?token=secret&user_id=6962241835"
+    redacted = _redacted_url(url)
+    assert "6962241835" not in redacted
+    assert "user_id=***" in redacted
+    assert "token=***" in redacted
+
+
 def test_redacted_url_passthrough_without_query():
     url = "https://api.helki.com/api/v2/devs"
     assert _redacted_url(url) == url
