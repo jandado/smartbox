@@ -7,6 +7,19 @@ class SmartboxError(Exception):
     """Base class for every error raised by this library."""
 
 
+class WsUserUnsupportedError(SmartboxError):
+    """The account's API host does not serve the ``ws_user`` endpoint.
+
+    Raised on deterministic handshake rejections and on non-JWT access
+    tokens — per the fallback doctrine, transient network failures must
+    never be mistaken for "endpoint unsupported". Contexts differ:
+    ``check_ws_user_support`` (one-shot probe on a fresh token) maps
+    401/403/404/410; the run loop retries everything except 404/410
+    (401/403 also mean expired-but-refreshable mid-run). Callers should
+    fall back to the ``socket_io`` transport when this is raised.
+    """
+
+
 class SmartboxValidationError(SmartboxError):
     """A response payload did not match its model (``raw_response=False``).
 

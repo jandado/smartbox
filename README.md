@@ -171,6 +171,45 @@ or by specifying a python version
 
     tox -e py314
 
+## Websocket transports
+
+Status updates arrive over one of two transports; both are implemented
+in this library and verified live (api-notes.md, "Transports —
+socket_io vs ws_user"):
+
+* **`socket_io`** (default): a per-device socket.io connection. The
+  `UpdateManager` owns it; `run()` runs the loop, `cancel()` is
+  terminal.
+* **`ws_user`** (the vendor web apps' channel): ONE plain-WebSocket
+  connection (`WsUserSocketSession`) serves every device of the
+  account. Its server-side proxy PINGs keep the session supervised, and
+  sockets are cut by the server exactly at the access token's 4 h
+  expiry (close code 1006) — the reconnect with a fresh token is
+  mandatory and part of the steady state.
+
+Caller contract for the shared ws_user socket:
+
+    socket_ = WsUserSocketSession(session)
+    # The caller owns run() — and must SUPERVISE it: run() exits on any
+    # failure (it is re-runnable; only cancel() is terminal), and a
+    # parked UpdateManager never observes a shared-socket death, so
+    # without a supervisor the transport dies silently. Exceptions
+    # surface when the task is awaited, so keep and await it.
+    task = asyncio.create_task(supervise(socket_.run()))
+    socket_.add_device(dev_id, dev_data_cb, update_cb)   # register (any time)
+    socket_.remove_device(dev_id)                        # unregister
+    await socket_.cancel()          # TERMINAL: later run() calls no-op
+
+`run()` raises `InvalidAuthError` (rejected credentials — start a
+reauthentication flow) and `WsUserUnsupportedError` (deterministic
+404/410 — the host does not serve ws_user; fall back to socket_io).
+
+`UpdateManager(session, dev_id, ws_user_socket=socket_)` switches an
+individual manager onto the shared connection: `run()` registers the
+manager's device and parks until `cancel()` (the shared socket's own
+restarts are handled by its supervisor, not by per-device consumers).
+Pass-through SocketSession kwargs are ignored in this mode (warned).
+
 # Support
 [![Buy a coffee to ajtudela][buymeacoffee-shield]][buymeacoffee-ajtudela]
 

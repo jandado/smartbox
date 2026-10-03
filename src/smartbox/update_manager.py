@@ -17,6 +17,7 @@ from smartbox.error import (
 )
 from smartbox.session import AsyncSmartboxSession
 from smartbox.socket import SocketSession
+from smartbox.ws_user import WsUserSocketSession
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -173,20 +174,45 @@ class UpdateManager:
         device_id: str,
         write_confirm_timeout: float = _DEFAULT_WRITE_CONFIRM_TIMEOUT,
         unavailable_delay: float = _DEFAULT_UNAVAILABLE_DELAY,
+        ws_user_socket: WsUserSocketSession | None = None,
         **kwargs: Any,  # noqa: ANN401  # pass-through SocketSession knobs
     ) -> None:
-        """Create an UpdateManager for a smartbox socket."""
+        """Create an UpdateManager for a smartbox socket.
+
+        Two transports are supported:
+
+        * ``socket_io`` (default): this manager owns a per-device
+          :class:`~smartbox.socket.SocketSession`; ``run()`` runs it.
+        * ``ws_user``: pass a shared :class:`~smartbox.ws_user.WsUserSocketSession`
+          as ``ws_user_socket`` — one per-user connection serves every
+          device; ``run()`` registers this manager's ``device_id`` with
+          the shared socket and waits for it to finish, and ``cancel()``
+          unregisters. The shared socket's ``run()`` is owned by the
+          caller.
+        """
         self._session = session
         self._device_id = device_id
         self._write_confirm_timeout = write_confirm_timeout
         self._unavailable_delay = unavailable_delay
-        self._socket_session = SocketSession(
-            session,
-            device_id,
-            self._dev_data_cb,
-            self._update_cb,
-            **kwargs,
-        )
+        self._ws_user_socket = ws_user_socket
+        self._ws_user_cancelled = False
+        if ws_user_socket is not None and kwargs:
+            _LOGGER.warning(
+                "Ignoring socket knobs %s in ws_user mode", sorted(kwargs)
+            )
+        if ws_user_socket is not None:
+            self._socket_session: SocketSession | None = None
+            # cancel() must stop a concurrent/awaited run() the same way
+            # it does in socket_io mode (cancel ⇒ run() returns).
+            self._ws_user_release_event: asyncio.Event | None = None
+        else:
+            self._socket_session = SocketSession(
+                session,
+                device_id,
+                self._dev_data_cb,
+                self._update_cb,
+                **kwargs,
+            )
         self._dev_data_subscriptions: list[DevDataSubscription] = []
         self._update_subscriptions: list[UpdateSubscription] = []
         # Node-availability tracking (see subscribe_to_node_availability).
@@ -203,16 +229,58 @@ class UpdateManager:
         self._pending_confirms: dict[tuple[str, int, str], _PendingWrite] = {}
 
     @property
-    def socket_session(self) -> SocketSession:
-        """Get the underlying socket session."""
+    def socket_session(self) -> SocketSession | None:
+        """Get the underlying per-device socket session.
+
+        None in ``ws_user`` mode (the shared socket takes over); use
+        :attr:`ws_user_socket` there.
+        """
         return self._socket_session
 
+    @property
+    def ws_user_socket(self) -> WsUserSocketSession | None:
+        """The shared per-user socket (None in socket_io mode)."""
+        return self._ws_user_socket
+
     async def run(self) -> None:
-        """Run the socket session asynchronously, waiting for updates."""
+        """Run the socket session asynchronously, waiting for updates.
+
+        In ws_user mode this registers with the shared per-user socket
+        and parks until :meth:`cancel` releases it (or a prior cancel
+        made it a no-op); the shared socket's ``run()`` loop is owned by
+        the caller. It does NOT return when the shared socket's run loop
+        exits: the caller's supervisor owns restarts, registrations
+        survive them, and a return here would only make a per-device
+        watchdog misdiagnose a healthy-but-restarting transport.
+        """
+        if self._ws_user_socket is not None:
+            if self._ws_user_cancelled:
+                return
+            self._ws_user_socket.add_device(
+                self._device_id,
+                self._dev_data_cb,
+                self._update_cb,
+            )
+            release = asyncio.Event()
+            self._ws_user_release_event = release
+            try:
+                # Park until released — see run()'s docstring for why a
+                # shared-socket exit must not wake us.
+                await release.wait()
+            finally:
+                self._ws_user_release_event = None
+                self._ws_user_socket.remove_device(self._device_id)
+            return
+        assert self._socket_session is not None  # noqa: S101 - narrowing
         await self._socket_session.run()
 
     async def cancel(self) -> None:
-        """Disconnecting and cancelling tasks."""
+        """Disconnecting and cancelling tasks.
+
+        In ws_user mode this only releases THIS manager (a parked
+        ``run()`` returns and the device unregisters); the shared socket
+        is owned by the caller and is NOT cancelled.
+        """
         tasks: list[asyncio.Task] = list(self._lost_timers.values())
         tasks.extend(
             pending.task
@@ -226,6 +294,14 @@ class UpdateManager:
         # The socket cancel below is the yield point at which the
         # cancellations above are actually processed; nothing here awaits
         # them separately (verified: no un-retrieved/destroyed warnings).
+        if self._ws_user_socket is not None:
+            # cancel ⇒ run() returns promptly (socket_io contract).
+            self._ws_user_cancelled = True
+            if self._ws_user_release_event is not None:
+                self._ws_user_release_event.set()
+            self._ws_user_socket.remove_device(self._device_id)
+            return
+        assert self._socket_session is not None  # noqa: S101 - narrowing
         await self._socket_session.cancel()
 
     def subscribe_to_dev_data(self, jq_expr: str, callback: Callable) -> None:

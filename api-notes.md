@@ -2,7 +2,7 @@
 Some brief notes on the REST endpoints used by this library.
 
 > **See also:** `webapi-spec.md` (same repo) — the full vendor-API surface as
-> used by the official app (extracted from the app bundle 2026-09-26),
+> used by the official app (2026-09-26),
 > including schedule/program (`/prog`) semantics, write-body shapes, and the
 > discrepancy list (D1–D7) for the scheduling feature.
 
@@ -133,7 +133,9 @@ Briefly:
 * The server will send periodic `update` events containing device and node
   status updates
 * The client should send a `ping` message every 20s (in addition to the protocol
-  level ping/pong). Have not tested that this is strictly necessary.
+  level ping/pong). Have not tested that this is strictly necessary. (2026-10-01:
+  nothing ever answers it — see the server-silence and ws_user sections below;
+  the vendor web app sends no application-level pings at all.)
 
 ## `update` Messages
 
@@ -427,9 +429,8 @@ works fine with the fixed integration).
 
 ### Away status writes (D1 closed, with an observation)
 * The app sends `{"away": bool, "enabled": bool}` (enabled defaults
-  true in the app's dev-proxy wrapper) — confirmed in the app bundle
-  (`setDevAwayStatus`). Home-level away writes use `{"away": value}`
-  only.
+  true in the app's dev-proxy wrapper) — confirmed against the app.
+  Home-level away writes use `{"away": value}` only.
 * Verified live: both `{"away": true}` alone and `{"away": true,
   "enabled": true}` are honoured (away toggled true and back via
   `{"away": false, "enabled": true}`). `enabled` is tolerated but not
@@ -461,7 +462,7 @@ log `.exception()` → `.warning()`. Covered by `tests/test_socket.py`.
 
 ### Management/fleet surface (implemented 2.6.0, unverified live)
 The remaining webapi-spec §2–3 endpoints are now thin session methods
-(paths where the spec was terse were confirmed in the app bundle):
+(paths where the spec was terse were confirmed in the official app):
 * Device: `mgr/discovery` GET/POST, `mgr/rtc/time` GET, `name` POST,
   `group` POST (pass-through), DELETE device.
 * Node fleet ops: `name`/`select` POST, `power` GET, DELETE node
@@ -473,16 +474,14 @@ The remaining webapi-spec §2–3 endpoints are now thin session methods
   `<frontend>/invite-confirm/nserie<serial_id>`) and unauthenticated
   `POST /api/v2/users/<uid>/invite_confirmation` (`{pass, code}`).
 * Notifications: `GET/POST /api/notifications/v1/<gid>/presence/config`
-  + `POST .../test` (confirmed in the app bundle:
-  `getQuietHomeNotifications` / `setQuietHomeNotifications` /
-  `testQuietHomeNotifications`).
+  + `POST .../test` (confirmed in the official app).
 * Utility: `GET /api/v2/encrypted_wifi_credentials?ssid=&pass=` (the
   server performs the AES-256-CBC PBE; query params deliberately not
   logged — secrets), `GET /api/location/v1/coordinates`.
 New base helpers: `_api_delete`, `_api_get` (host-relative path, query
 params), `_api_post_path` (host-relative POST, optional auth for
 anonymous flows). All of these are untested against live hardware except
-where noted; paths come from the app bundle + spec.
+where noted; paths come from the official app + spec.
 
 #### Read-verified live (2026-09-27, same session)
 * `GET .../mgr/discovery` → `{"discovery": "off"}` ✔.
@@ -579,7 +578,7 @@ below are from that session (htr/3 on a 5-node device).
   ok status frame (which arrives within ~0.3–0.5 s on a live node).
   The vendor app flags a node unreachable ~5–6 s after a command whose
   confirmation never arrives — a client-side timeout, not an API answer
-  (its bundle never references `sync_status`).
+  (the app never references `sync_status`).
 * **No-op (idempotent) writes produce NO frames at all**, even on live
   nodes — a `mode: off → off` POST caused no transient lost, no ok push.
   The transient post-write lost→ok pattern therefore only fires for
@@ -601,3 +600,244 @@ below are from that session (htr/3 on a 5-node device).
   mode: the bare-lost status payload fails NodeStatus validation, so
   `SmartboxValidationError` carries the wire `payload` and a
   lost-marked one counts as the Unavailable verdict.
+
+## Transports — `socket_io` vs `ws_user` (spec, verified 2026-10-01/02)
+
+Two websocket transports are maintained in parallel by helki. Facts
+below are verified live on the api-lhz host unless marked otherwise.
+
+| | `socket_io` (this library today) | `ws_user` (vendor web apps) |
+|---|---|---|
+| Scope | per-device (`dev_id` param) | per-user — ONE socket for all homes/devs |
+| URL | `wss://<host>:443/api/v2/socket_io?token=<enc>&dev_id=<id>` | `wss://<host>:443/api/v2/ws_user?token=<enc>&user_id=<id>` |
+| Protocol | socket.io over engine.io (EIO=4 from Python; EIO=3 from the mobile app — endpoint accepts both) | plain WebSocket, JSON frames |
+| Keep-alive | EIO=4 assigns it to the SERVER, which NEVER pings; the lib's 20 s app-level `"ping"` is never answered; client traffic does not reset the read-loop timer | server/proxy sends a WebSocket PING every 30.000 s; the client answers automatically (browser PONG / aiohttp autoping); client-initiated WS PINGs ARE also answered (verified) — the client heartbeat is the designed liveness mechanism; NO app-level ping exists in the protocol |
+| Failure on server silence | read loop aborts after exactly `pingInterval + pingTimeout` (25 + 60 = 85 s) — "Server has stopped communicating"; recurs every 3–7 min while the half-open TCP lingers | multi-minute data silence is NORMAL (max observed 789 s ≈ 13 min, survived); liveness belongs to the proxy PING layer — NEVER treat data silence as failure |
+| Socket lifecycle | disconnects tied to session expiry (the 3–7 min abort cycle) | socket is cut by the server EXACTLY at its token's `exp` (4 h TTL): close code 1006 = abnormal (TCP dropped, no close frame, no HTTP error) → mandatory fresh-token reconnect every 4 h, ~4 s outage (verified end-to-end) |
+| Vendor reconnect reference | mobile app: backoff `2^n·1 s` cap 30 s, forced `checkConnection` reauth first, stop on 401 | web app: backoff `1 s·2^n` ±20 % jitter cap 30 s, max 5 attempts or 30 s total, then permanent-failure UI; ALWAYS a fresh token per connect |
+
+### ws_user frames (verified)
+
+* The client sends ONE message type: `{"event":"all_data"}` on open,
+  re-sent 1 s-debounced on every server `{"event":"should_sync"}`.
+* Server replies `{"event":"all_data","data":[homes]}` (full snapshot:
+  homes → devs → devData; ~8 kB for 1 home / 1 dev / 5 nodes) and
+  pushes `{"event":"update","devid":…,"data":{"path":…,"body":…}}`
+  frames (the path/body pair lives under a `data` key — verified live;
+  an earlier version of this section wrongly recorded it flat) —
+  payload fields identical to socket_io (`sync_status`, `stemp`,
+  `mtemp`, `power`, …). The handler surface covers the full
+  path set: `/mgr/away_status`, `/connected`, `/geo_data`,
+  `/mgr/nodes`, `/htr_system/power_limit`, node status/prog/setup.
+* Idle push cadence varies between runs: steady ~44 s in one, bursts
+  then minutes of silence in another.
+* NOT yet observed live (open items): `should_sync` (see the outage
+  chapter below — three trigger hypotheses rejected) and socket-side
+  write behaviour (both vendor apps write via REST; the web app
+  sends only `all_data`).
+
+### Box outage + write semantics (2026-10-02, three live variants)
+
+* Box outage cycle (2026-10-02, ethernet pull): mains-off at
+  18:12:50 → `/connected` false 18:13:39 (recognition latency 49 s —
+  backend detects a dead box within one proxy-ping cycle; the socket
+  keeps pushing last-known node data in the meantime, so `/connected`
+  is the only offline signal). Replug 18:16:57 → `/connected` true
+  18:17:03 (6 s) + second redundant true 18:17:25; then a full-state
+  burst at 18:17:08: `/pmo_system`, `/htr_system/setup`,
+  `/mgr/nodes` ×5 (byte-identical; one copy per node-count — cause
+  unknown), `/mgr/discovery`, `/mgr/away_status`, then per-node
+  status + `/prog` frames. First live sightings of away/discovery/
+  prog/node-list frames on ws_user. Transport notes: tolerate
+  redundant state frames (repeated `/connected` true, ×5 nodes).
+* `should_sync` did NOT fire in either variant — mains cycle
+  (18:12–18:17) AND internet-only cut (18:26–18:29); hypotheses
+  "box reconnect" and "warm server reconnect" both rejected; trigger
+  remains unknown. It stays verified-by-code (debounced all_data
+  re-request), not by wire.
+* **Writes to an offline box (2026-10-02, live)**: the vendor app
+  first showed apparent success, then errored within seconds ("could
+  not reach the device") — the cloud attempts a live relay, does NOT
+  queue writes for an unreachable box, and the failed write left no
+  residue (the target node stayed off). App does not gate writes on
+  `/connected` (heaters stayed "available" while offline). Write
+  guarantee: applied-or-errored, never deferred.
+* **Warm reconnect WITH state divergence (2026-10-02)**: physical
+  node change during the outage (mode → manual) reached the server
+  ~67 s after reconnect via the box's ORDINARY reporting cadence; no
+  burst, no forced re-sync — server/box divergence resolves silently
+  through normal pushes. Warm reconnects need no special client
+  handling beyond the `/connected` flag.
+* **Warm vs cold reconnect (2026-10-02, same session, both live)**:
+  internet-only outage (upstream switch pulled, box powered,
+  unplug 18:26:25) → `/connected` false 18:27:09 (latency 44 s,
+  same sub-minute detection as mains-off: detection is
+  session-driven, indifferent to failure mode) → true 18:28:47
+  (replug 18:28:33, latency 14 s; redundant second true 18:28:56 —
+  double-announce consistent across variants, 22 s apart cold / 9 s
+  warm) → **NO state burst**: only normal-cadence node pushes
+  (current values, so outage drift self-corrects via ordinary
+  reporting). Cold boot burst (full re-sync incl. `/mgr/nodes`,
+  `/prog`) is tied to the box re-registering its devices. Client
+  transport: warm reconnect needs NO special handling beyond the
+  `/connected` flag; tolerance of redundant state frames confirmed.
+
+### ws_user token lifecycle (verified)
+
+* Access tokens are JWTs with a 4 h TTL; claims
+  `{clientId, email, exp, iat, iss, scope, serialId, userId}` — the
+  `userId` claim is the ws_user URL's `user_id` param.
+* The handshake validates `exp`: an expired token is rejected with
+  HTTP 401. Fresh token per connect is LOAD-BEARING.
+* Mid-session expiry is enforced: open sockets die exactly at token
+  `exp` (see lifecycle row above).
+* Refresh tokens are long-lived and REUSABLE: a >4 h-old refresh token
+  minted fresh pairs repeatedly; each grant rotates `refresh_token`
+  (old one remains valid). Response:
+  `{access_token, expires_in, refresh_token, token_type}` — raw key is
+  `access_token`, the library normalizes to `token`.
+* Parallel password logins return the BYTE-IDENTICAL access token
+  (deterministic re-issue, no `jti`); multiple concurrent ws_user
+  sockets on the same token all work; no session invalidation exists —
+  HA, web app and mobile app coexist by design.
+
+### Client-side outage & liveness (2026-10-02, Wi-Fi drop + airplane mode, live)
+
+* **Client-side outages are INVISIBLE to the socket.** Two forced
+  outages (75 s Wi-Fi drop; 120 s airplane mode): zero client-side
+  errors — `receive()` just blocks on the half-open TCP connection;
+  the kernel keeps it ESTABLISHED (Wi-Fi down does NOT close TCP).
+* **Server-side close is UNKNOWABLE from an offline client.** (An
+  earlier note here wrongly concluded "the proxy tolerates missed
+  PONGs" from the absence of a client-visible close — retracted.) The
+  consistent model: the proxy detects the dead peer (missed
+  PONGs/keepalives), closes ITS end — FIN or a single RST — and
+  drops state; every close packet is lost because the client is
+  offline, and a lost RST is never retransmitted. The client keeps a
+  phantom ESTABLISHED socket forever: inbound silence, no errors
+  (it never sends, so no send failures either). The two cases
+  "proxy still alive, just quiet" and "proxy closed, state dropped"
+  are indistinguishable from the client — treat every post-outage
+  socket as DEAD until proven alive.
+* **Writes double as liveness checks.** A write/ping attempt into a
+  dead-path socket fails fast (RST from the stateless server kernel
+  or middlebox) or times out via retransmission — the only ways the
+  socket "realizes". The ws_user transport gets implicit outage
+  detection on every write; the explicit mechanism (client heartbeat)
+  covers the idle periods.
+* **Address change = permanent half-open** (same mechanism as the
+  invisibility above): after airplane mode the socket stayed
+  ESTABLISHED but a forced state change (heater toggle, reliably
+  pushed all day) never arrived — the path was dead and the socket
+  would hang forever with no client-side signal. TCP half-open is the
+  failure mode a transport MUST detect on its own.
+* **Client-initiated WS PINGs ARE answered** (verified via aiohttp
+  `heartbeat=5`: four ping cycles, PONGs present — a missing PONG
+  closes the connection with ServerTimeoutError within ~2.5 s of the
+  ping; none occurred). NOTE: with `autoping=True` (default) aiohttp
+  swallows PONGs internally — `receive()` never surfaces them, so
+  liveness tests must use the `heartbeat` parameter or expect no
+  visible PONGs.
+* Transport liveness design (settled, and wire-verified end to end in
+  the heartbeat toggle section below): run with a client heartbeat —
+  60 s verified (detection ≤60 s locally, 13 retriable failures
+  through a 2 min outage, recovery 2 s after return); do NOT use data
+  cadence (silence up to 13 min is normal); server-side supervision
+  (proxy PING every 30 s) is already free; token expiry forces the
+  mandatory reconnect every 4 h regardless. Writes double as
+  implicit liveness checks during activity.
+
+### Heartbeat Wi-Fi toggle — 2026-10-02 20:00–20:11, the full cycle verified
+
+Probe with `--heartbeat 60` (client PING every 60 s, PONG window 30 s),
+user toggled Wi-Fi OFF 20:09:00 → ON 20:11:02:
+
+* 20:07:45 last data push; **socket died locally ~20:09:0x–09:4x**
+  (`closed code=1006` in the log before the first post-toggle reconnect
+  attempt): the heartbeat PING's send into a dead interface failed —
+  client-side detection WITHOUT waiting for any PONG window, ~60 s
+  worst case. (The earlier no-heartbeat runs hung silently instead:
+  heartbeat is what converts the invisible half-open into a detectable
+  close. The locally-detected death is also reported as 1006.)
+* Outage: **13 consecutive retriable failures** (`re-auth unavailable`
+  / DNS + transport) at the ~3.5 s backoff cadence — zero hangs, zero
+  fatal exits (after the probe itself was fixed to honour the fallback
+  doctrine; the first run treated an offline-DNS failure as fatal —
+  see probe fix note below).
+* **Recovery 2 s after network return** (ON 20:11:02 → connected
+  20:11:04): fresh token, fresh socket, all_data re-delivered.
+* Transport verdict: heartbeat=N gives dead-path detection ≤ N + local
+  send error (worst case ~N + N/2), full reconnect-with-backoff
+  through the outage, and instant recovery on return — all verified
+  against the live server. The `1006` close code does NOT
+  distinguish server-initiated from locally-detected deaths (both
+  surface as 1006) — timestamps and context are the discriminator.
+* Probe implementation note: the first heartbeat run failed the
+  doctrine (an offline DNS error in the re-auth path aborted the run
+  via APIUnavailableError); fixed so transient re-auth failures are
+  retried and only auth rejections stop — the transport must repeat
+  this exact handling.
+
+### Reseller support matrix (frontend vintage = proxy signal only)
+
+| Reseller | Web app vintage | WS channel |
+|---|---|---|
+| Helki (app.helki.com) | modern Vue | `ws_user` |
+| iHeatControl | modern Vue | `ws_user` |
+| SmartControl | modern Vue | `ws_user` |
+| Technotherm/TTI | modern Vue | `ws_user` |
+| Electrorad | legacy jQuery app | `socket_io` |
+
+* All four modern web apps ship the identical protocol verbatim.
+* Resellers do NOT update in tandem (Electrorad still ships the
+  socket_io-era app). Whether each reseller's API host deploys the
+  supervised ws_user backend is UNVERIFIED except api-lhz — a released
+  library must not assume ws_user exists everywhere.
+
+### Implications for the library (verified facts)
+
+* ws_user replaces N per-device sockets with 1 per-user socket:
+  supervised liveness, a ~4 s outage every 4 h instead of the 3–7 min
+  abort cycle, fresh token per reconnect.
+* socket_io is NOT deprecated: the mobile apps (built 2025-08) still
+  use it, and the 20 s app-level `"ping"` originates there — the
+  lib's keepalive copy is faithful to the vendor's mobile client.
+* Probe tooling (verified live, gates clean): `tools/probe_ws_user.py`
+  — multi-cycle reconnect with close-code logging, `--heartbeat N`
+  (client liveness, see toggle section), `--token-file` (store/reuse
+  token bundles chmod 600: authenticate once, reuse verbatim later —
+  no REST refresh, controlled token age; used for the expiry tests),
+  fallback doctrine encoded (below).
+* Fallback doctrine (encoded in `tools/probe_ws_user.py` and the lib):
+  ONLY deterministic handshake rejections signal "endpoint unsupported"
+  → fallback; transient transport errors are retried and NEVER treated
+  as unsupported. Context split: the one-shot capability probe
+  (`check_ws_user_support`, run on a fresh token) maps 401/403/404/410
+  → WsUserUnsupportedError; the run loop retries everything except
+  404/410 (mid-run 401/403 also mean expired-but-refreshable), and a
+  mid-run 401/403 forces a token invalidation + refresh instead of
+  retrying the same URL (no-op refresh under clock skew). The probe
+  tool's FAIL path mirrors the run-loop semantics.
+
+### Observation log (evidence trail)
+
+* 2026-10-01, HA log (engineio debug): 85 s silence-abort math
+  confirmed to the ms (last packet 13:07:19.686 → abort 13:08:44.687);
+  recovery ~2 s.
+* 2026-10-01, web app (smartcontrol.lucht-lhz.de): ws_user protocol,
+  6 s all_data watchdog, reconnect policy, token lifecycle.
+* 2026-10-01, tcpdump of live web app: proxy WS PING every 30.000 s
+  (24-byte TLS record = 2-byte PING; 28-byte record = 6-byte masked
+  PONG); idle HTTP/2 connection got an h2 PING after ~9 idle minutes
+  and Chrome FIN-ed it; update pushes = 464-byte plaintext.
+* 2026-10-01, Android app `com.technotherm.lhzapp` 1.417.1 (built
+  2025-08-20): socket_io channel (`socket.io-client ~1.5.1`, EIO=3),
+  20 s app-level ping origin, reconnect + reauth design.
+* 2026-10-01, ws_user probe first run: library token accepted as-is;
+  all_data shape OK; 28 updates / 300 s; max gap 47.7 s.
+* 2026-10-01/02, 4 h idle run: zero closes; 133 updates; 70 gaps
+  >85 s, 25 >180 s, max 448.9 s — all survived.
+* 2026-10-02, forced experiments: expired-token handshake → 401;
+  refresh grant → 200, reusable + rotating; parallel logins →
+  identical tokens, concurrent sockets OK; mid-session expiry →
+  close 1006 exactly at exp, ~4 s reconnect.

@@ -8,6 +8,7 @@ from .error import (
     ResellerNotExistError,
     SmartboxError,
     SmartboxValidationError,
+    WsUserUnsupportedError,
 )
 from .models import (
     AcmNodeStatus,
@@ -40,6 +41,7 @@ from .reseller import AvailableResellers, SmartboxReseller
 from .session import AsyncSmartboxSession, Session
 from .socket import SocketSession
 from .update_manager import UpdateManager
+from .ws_user import WsUserSocketSession, check_ws_user_support
 
 try:
     __version__ = importlib.metadata.version("smartbox")
@@ -85,4 +87,7 @@ __all__ = [
     "SocketSession",
     "Token",
     "UpdateManager",
+    "WsUserSocketSession",
+    "WsUserUnsupportedError",
+    "check_ws_user_support",
 ]

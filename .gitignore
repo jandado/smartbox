@@ -73,3 +73,9 @@ junit.xml
 .DS_Store
 
 *.code-workspace
+
+# ws_user probe token stores (contain live credentials)
+*token*store*.json
+wsu_store.json
+*token*store*.json.tmp
+wsu_store.json.tmp
