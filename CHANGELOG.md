@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### New
+* Per-user `ws_user` websocket transport (`WsUserSocketSession`,
+  `check_ws_user_support`): one connection serves every device of the
+  account, replacing N per-device `socket_io` sessions. Wire protocol
+  and every failure mode verified live (api-notes.md, "Transports —
+  socket_io vs ws_user"). Selected via the new `ws_user_socket=` kwarg
+  on `UpdateManager`; the default transport is unchanged.
+* `WsUserUnsupportedError` + the fallback doctrine: only deterministic
+  handshake rejections (HTTP 401/403/404/410 in the one-shot probe on a
+  fresh token; 404/410 in the run loop, or 401/403 that keep rejecting
+  freshly minted tokens) signal "endpoint unsupported"; transient
+  trouble is retried and never demotes.
+* In `ws_user` mode `UpdateManager` ignores the SocketSession
+  pass-through kwargs (warned at construction) — the shared socket's
+  liveness is heartbeat-driven, not knob-driven.
+
+### Breaking
+* `UpdateManager.socket_session` now returns `None` when the manager
+  runs in `ws_user` mode (previously always a `SocketSession`); use the
+  new `ws_user_socket` accessor to distinguish modes.
+
 ### Features
 * CLI: every authentication option also resolves from a `SMARTBOX_*`
   environment variable, and the `smartbox` console script loads a `.env`
@@ -110,8 +131,8 @@ version bump).
   device group move, node select/power, group geo_data/extra_data, invite
   flows (invite/revoke/confirm — confirm is unauthenticated), quiet-home
   notification config GET/POST + test, encrypted-wifi-credentials and
-  geocoding helpers. Read-only-verified paths pinned from the vendor app
-  bundle; all writes marked **unverified on live hardware** in docstrings.
+  geocoding helpers. Read-only-verified paths pinned from the official
+  vendor app; all writes marked **unverified on live hardware** in docstrings.
   New base helpers: `_api_delete`, host-relative `_api_get` (params not
   logged — may carry secrets) and `_api_post_path` (auth optional).
 * Away-status writes default `enabled: true` to match the vendor app shape

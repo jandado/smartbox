@@ -65,7 +65,10 @@ HTTP_TOO_MANY_REQUESTS = 429
 # Query-parameter / body keys that carry secrets (access tokens on the
 # socket URL, passwords in invite-confirmation bodies, wifi passwords in
 # the wifi-credential helper); their values must never reach log output.
-_SENSITIVE_KEYS = frozenset({"token", "pass", "password"})
+# ``user_id`` is an account identifier, not a credential, but it is
+# equally masked: routine INFO logs get pasted verbatim into issues and
+# forums, and an account key has no debugging value there.
+_SENSITIVE_KEYS = frozenset({"token", "pass", "password", "user_id"})
 
 _LOGGER = logging.getLogger(__name__)
 

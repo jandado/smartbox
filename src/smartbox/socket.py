@@ -10,7 +10,11 @@ import urllib.parse
 
 import socketio
 
-from smartbox.error import APIUnavailableError, InvalidAuthError, SmartboxError
+from smartbox.retry import (
+    backoff_delay,
+    refresh_auth_with_retry,
+    sleep_unless_exiting,
+)
 from smartbox.session import AsyncSmartboxSession, _redacted_url
 
 _API_V2_NAMESPACE = "/api/v2/socket_io"
@@ -392,9 +396,8 @@ class SocketSession:
                         break
 
                     remaining = self._reconnect_attempts - attempt - 1
-                    sleep_time = min(
-                        self._backoff_factor * (2**attempt),
-                        _MAX_RECONNECT_SLEEP,
+                    sleep_time = backoff_delay(
+                        attempt, self._backoff_factor, _MAX_RECONNECT_SLEEP
                     )
                     _LOGGER.warning(
                         "Received error on connection attempt, %s retries remaining, sleeping %ss",
@@ -435,35 +438,18 @@ class SocketSession:
         password-login fallback also failed) propagate out of ``run()``.
         Returns early once an exit is requested.
         """
-        failures = 0
-        while not self._loop_should_exit:
-            try:
-                await self._session.check_refresh_auth()
-            except InvalidAuthError:
-                _LOGGER.warning(
-                    "Credentials rejected; stopping websocket loop for %s",
-                    self._device_id,
-                )
-                raise
-            except (APIUnavailableError, SmartboxError) as e:
-                sleep_time = min(
-                    self._backoff_factor * (2**failures),
-                    _MAX_RECONNECT_SLEEP,
-                )
-                failures += 1
-                _LOGGER.warning(
-                    "Auth refresh failed (%s); retrying in %ss",
-                    e,
-                    sleep_time,
-                )
-                await self._sleep_unless_exiting(sleep_time)
-            else:
-                return
+        await refresh_auth_with_retry(
+            self._session.check_refresh_auth,
+            exit_requested=lambda: self._loop_should_exit,
+            sleep_unless_exiting=self._sleep_unless_exiting,
+            backoff_factor=self._backoff_factor,
+            max_sleep=_MAX_RECONNECT_SLEEP,
+            log_context=f"device {self._device_id}",
+        )
 
     async def _sleep_unless_exiting(self, delay: float) -> None:
         """Sleep up to ``delay`` seconds, waking early once exit is requested."""
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._exit_event.wait(), timeout=delay)
+        await sleep_unless_exiting(self._exit_event, delay)
 
     def _request_exit(self) -> None:
         """Flag the run loop to stop and wake any backoff sleep."""

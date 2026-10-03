@@ -16,6 +16,7 @@ from smartbox.update_manager import (
     UpdateSubscription,
     _written_applied,
 )
+from smartbox.ws_user import WsUserSocketSession
 
 
 @pytest.fixture
@@ -938,3 +939,36 @@ async def test_availability_frame_unknown_sync_status_no_timer(tracked, events):
     assert not tracked._lost_timers
     await asyncio.sleep(0.15)
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_update_manager_ws_user_mode_registers_and_unregisters(
+    mock_session,
+):
+    """ws_user mode: run() registers with the shared socket; cancel unregisters."""
+    shared = MagicMock(spec=WsUserSocketSession)
+    manager = UpdateManager(
+        mock_session, "dev_id_under_test", ws_user_socket=shared
+    )
+    assert manager.socket_session is None
+    assert manager.ws_user_socket is shared
+
+    task = asyncio.create_task(manager.run())
+    await asyncio.sleep(0)
+    # Observable contract: register the manager's device with two
+    # callbacks (the internal dispatcher wiring is not part of it).
+    args, _ = shared.add_device.call_args
+    assert args[0] == "dev_id_under_test"
+    assert callable(args[1])
+    assert callable(args[2])
+    await manager.cancel()
+    await asyncio.wait_for(task, 1)
+    shared.remove_device.assert_called_with("dev_id_under_test")
+
+
+def test_update_manager_default_mode_still_owns_socket(mock_session, mocker):
+    """Without ws_user_socket the manager owns a SocketSession (unchanged)."""
+    mocker.patch("smartbox.update_manager.SocketSession", autospec=True)
+    manager = UpdateManager(mock_session, "dev_id_under_test")
+    assert manager.socket_session is not None
+    assert manager._ws_user_socket is None
