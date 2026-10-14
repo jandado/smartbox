@@ -885,3 +885,250 @@ async def test_short_cycles_escalate_then_reset(
     finally:
         await sock.cancel()
         await asyncio.wait_for(task, 2)
+
+
+def jwt_with_payload(payload):
+    """Build a JWT-shaped token whose payload section is ``payload``."""
+    raw = json.dumps(payload).encode()
+    b64 = base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+    return f"hdr.{b64}.sig"
+
+
+@pytest.mark.asyncio
+async def test_non_string_user_id_claim_demotes(ws_user_session):
+    """A non-string userId claim cannot address the per-user endpoint.
+
+    The claim is interpolated into the URL's user_id parameter: a
+    non-string there is a malformed token, the same permanent demotion
+    as a non-JWT token (never a retry).
+    """
+    ws_user_session._access_token = jwt_with_payload({"userId": 42})
+    with pytest.raises(WsUserUnsupportedError, match="not a string"):
+        await check_ws_user_support(ws_user_session)
+
+
+@pytest.mark.asyncio
+async def test_wait_closed_releases_on_run_exit(ws_user_session, mocker):
+    """wait_closed() returns once the run loop finished — even on errors.
+
+    The event is set by run()'s finally (also on exception exits), so a
+    waiter must not strand when the run dies with a propagated error.
+    """
+    sock, _, _ = make_ws_socket(mocker, ws_user_session, [])
+    mocker.patch.object(
+        ws_user_session,
+        "check_refresh_auth",
+        AsyncMock(side_effect=InvalidAuthError("bad credentials")),
+    )
+    task = asyncio.create_task(sock.run())
+    await asyncio.wait_for(sock.wait_closed(), 2)
+    assert sock.closed is True
+    with pytest.raises(InvalidAuthError):
+        await task
+
+
+class TimedOutConnectCtx:
+    """ws_connect ctx whose handshake hangs past _CONNECT_TIMEOUT."""
+
+    def __init__(self):
+        self.aexit_exc_type = "not called"
+
+    async def __aenter__(self):
+        await asyncio.sleep(30)
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.aexit_exc_type = exc_type
+        return False
+
+
+@pytest.mark.asyncio
+async def test_connect_timeout_exits_ctx_and_fails_attempt(
+    ws_user_session, mocker, monkeypatch
+):
+    """A hung handshake aborts the attempt and releases the connection.
+
+    The asyncio.timeout bound around the handshake may have raced a
+    concurrently completed handshake, so the context is exited
+    best-effort instead of leaking the connection.
+    """
+    monkeypatch.setattr(ws_user_mod, "_CONNECT_TIMEOUT", 0.05)
+    ctx = TimedOutConnectCtx()
+    mocker.patch.object(
+        aiohttp.ClientSession,
+        "ws_connect",
+        MagicMock(return_value=ctx),
+        create=True,
+    )
+    sock = WsUserSocketSession(ws_user_session)
+    served = await sock._attempt_cycle(_WS_URL)
+    assert served is False
+    assert ctx.aexit_exc_type is None
+
+
+@pytest.mark.asyncio
+async def test_attempt_cycle_non_doctrine_status_returns_false(
+    ws_user_session, mocker
+):
+    """A non-doctrine HTTP rejection fails the attempt without raising.
+
+    Only 404/410 demote and 401/403 force a refresh; any other status
+    (5xx, 429, …) is transient: backoff + retry, never an exception out
+    of _attempt_cycle.
+    """
+    err = aiohttp.ClientResponseError(
+        MagicMock(), (), status=500, message="boom"
+    )
+    sock, _, _ = make_ws_socket(mocker, ws_user_session, [], connect_error=err)
+    served = await sock._attempt_cycle(_WS_URL)
+    assert served is False
+
+
+@pytest.mark.asyncio
+async def test_attempt_cycle_exit_requested_during_connect(
+    ws_user_session, mocker
+):
+    """An exit requested while connecting skips the snapshot request."""
+    sock, ws, _ = make_ws_socket(mocker, ws_user_session, [])
+    sock._request_exit()
+    served = await sock._attempt_cycle(_WS_URL)
+    assert served is True
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_attempt_cycle_send_failure_is_cycle_over(
+    ws_user_session, mocker
+):
+    """A failed all_data send ends the cycle as a failed attempt."""
+    sock, ws, _ = make_ws_socket(mocker, ws_user_session, [])
+    ws.send_json = AsyncMock(side_effect=aiohttp.ClientError("send died"))
+    served = await sock._attempt_cycle(_WS_URL)
+    assert served is False
+    assert sock._ws is None  # per-cycle teardown ran
+
+
+def binary_frame():
+    return aiohttp.WSMessage(aiohttp.WSMsgType.BINARY, b"\x00\x01", None)
+
+
+@pytest.mark.asyncio
+async def test_non_text_frames_are_ignored(ws_user_session, mocker):
+    """Non-TEXT frames (binary, …) are skipped without dispatching."""
+    sock, _, _ = make_ws_socket(
+        mocker, ws_user_session, [binary_frame(), closed_message()]
+    )
+    got = []
+    sock.add_device("dev_a", got.append, lambda _d: None)
+    served = await sock._attempt_cycle(_WS_URL)
+    assert served is True
+    assert got == []
+
+
+@pytest.mark.asyncio
+async def test_should_sync_frame_schedules_snapshot(ws_user_session, mocker):
+    """A server should_sync frame triggers the debounced all_data request."""
+    sock, ws, _ = make_ws_socket(mocker, ws_user_session, [])
+    sock._ws = ws
+    sock._should_sync_debounce = 0.01
+    sock._dispatch('{"event": "should_sync"}')
+    task = sock._should_sync_task
+    assert task is not None
+    await asyncio.wait_for(task, 1)
+    assert ws.sent == [{"event": "all_data"}]
+
+
+@pytest.mark.asyncio
+async def test_all_data_non_dict_entries_skipped(ws_user_session, mocker):
+    """Non-dict homes/devs are skipped; valid siblings still delivered."""
+    sock, _, _ = make_ws_socket(mocker, ws_user_session, [])
+    got = []
+    sock.add_device("dev_a", got.append, lambda _d: None)
+    sock._dispatch_all_data(
+        [
+            "not a dict",
+            {"devs": ["also not a dict", {"dev_id": "dev_a", "devData": {}}]},
+        ]
+    )
+    assert got == [{}]
+
+
+@pytest.mark.asyncio
+async def test_update_for_unregistered_device_ignored(ws_user_session, mocker):
+    """Update frames for devices with no consumer are dropped quietly."""
+    sock, _, _ = make_ws_socket(mocker, ws_user_session, [])
+    got = []
+    sock.add_device("dev_a", lambda _d: None, got.append)
+    sock._dispatch(
+        '{"event": "update", "devid": "ghost", '
+        '"data": {"path": "/htr/1/status", "body": {}}}'
+    )
+    assert got == []
+
+
+@pytest.mark.asyncio
+async def test_new_should_sync_supersedes_pending_one(ws_user_session, mocker):
+    """A re-schedule cancels the pending debounce task (debounce semantics)."""
+    sock, ws, _ = make_ws_socket(mocker, ws_user_session, [])
+    sock._ws = ws
+    sock._should_sync_debounce = 30.0
+    sock._schedule_all_data()
+    first = sock._should_sync_task
+    sock._schedule_all_data()
+    second = sock._should_sync_task
+    assert first is not second
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    # Bounded teardown of the still-pending replacement task.
+    await asyncio.wait_for(sock._cancel_should_sync(), 1)
+
+
+@pytest.mark.asyncio
+async def test_delayed_all_data_without_socket_is_quiet(
+    ws_user_session, mocker
+):
+    """A debounce firing after teardown must not touch a dead socket."""
+    sock, _, _ = make_ws_socket(mocker, ws_user_session, [])
+    sock._should_sync_debounce = 0.01
+    sock._schedule_all_data()
+    task = sock._should_sync_task
+    await asyncio.wait_for(task, 1)  # returns quietly; nothing to send to
+
+
+@pytest.mark.asyncio
+async def test_delayed_all_data_send_failure_is_swallowed(
+    ws_user_session, mocker
+):
+    """A dead socket during the debounced re-request must not raise."""
+    sock, ws, _ = make_ws_socket(mocker, ws_user_session, [])
+    sock._ws = ws
+    ws.send_json = AsyncMock(side_effect=OSError("socket gone"))
+    sock._should_sync_debounce = 0.01
+    sock._schedule_all_data()
+    await asyncio.wait_for(sock._should_sync_task, 1)
+
+
+@pytest.mark.asyncio
+async def test_connect_round_exits_before_attempt_when_exit_requested(
+    ws_user_session, mocker
+):
+    """A requested exit short-circuits the connect round to "exhausted"."""
+    sock, _, captured = make_ws_socket(
+        mocker, ws_user_session, [], connect_error=OSError("refused")
+    )
+    sock._request_exit()
+    status = await sock._connect_until_served_or_exhausted(_WS_URL, "tok")
+    assert status == "exhausted"
+    assert "url" not in captured  # no connect attempt was made
+
+
+@pytest.mark.asyncio
+async def test_cancel_cancels_pending_should_sync_task(ws_user_session, mocker):
+    """cancel() cancels a pending debounce task and clears it (bounded)."""
+    sock, ws, _ = make_ws_socket(mocker, ws_user_session, [])
+    sock._ws = ws
+    sock._should_sync_debounce = 30.0
+    sock._schedule_all_data()
+    task = sock._should_sync_task
+    await asyncio.wait_for(sock.cancel(), 1)
+    assert task.cancelled()
+    assert sock._should_sync_task is None

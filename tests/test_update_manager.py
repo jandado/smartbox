@@ -972,3 +972,34 @@ def test_update_manager_default_mode_still_owns_socket(mock_session, mocker):
     manager = UpdateManager(mock_session, "dev_id_under_test")
     assert manager.socket_session is not None
     assert manager._ws_user_socket is None
+
+
+def test_update_manager_ws_user_mode_warns_on_socket_knobs(
+    mock_session, caplog
+):
+    """Pass-through socket knobs are ignored (and warned about) in ws_user mode."""
+    shared = MagicMock(spec=WsUserSocketSession)
+    with caplog.at_level(logging.WARNING):
+        manager = UpdateManager(
+            mock_session,
+            "dev_id_under_test",
+            ws_user_socket=shared,
+            heartbeat=5.0,
+        )
+    assert any(
+        "Ignoring socket knobs" in r.getMessage() for r in caplog.records
+    )
+    # The ignored knobs left ws_user mode intact.
+    assert manager.socket_session is None
+
+
+@pytest.mark.asyncio
+async def test_update_manager_ws_user_run_after_cancel_is_noop(mock_session):
+    """run() after cancel() is a terminal no-op: nothing re-registers."""
+    shared = MagicMock(spec=WsUserSocketSession)
+    manager = UpdateManager(
+        mock_session, "dev_id_under_test", ws_user_socket=shared
+    )
+    await manager.cancel()
+    await asyncio.wait_for(manager.run(), 1)
+    shared.add_device.assert_not_called()

@@ -9,6 +9,7 @@ from pathlib import Path
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import ANY, AsyncMock, MagicMock, PropertyMock, patch
 
 import aiohttp
@@ -30,6 +31,7 @@ from smartbox.session import (
     _DEFAULT_RETRY_ATTEMPTS,
     AsyncSession,
     Session,
+    _call_budget,
     _redact_body,
     _redacted_url,
 )
@@ -2774,3 +2776,294 @@ async def test_sync_call_in_running_loop_closes_coroutines(
     gc.collect()
     never_awaited = [w for w in recwarn if "never awaited" in str(w.message)]
     assert not never_awaited
+
+
+# Sync Session management-surface wrappers: every one is a
+# ``return self._run_and_close(self._async.<method>(**kwargs))``
+# pass-through, so one data-driven table pins method + argument
+# forwarding for all of them. ``async_method`` differs from the sync
+# name only where the names drifted (e.g. set_mode/set_node_mode).
+_SYNC_MANAGEMENT_WRAPPERS: list[tuple[str, str, dict[str, Any]]] = [
+    (
+        "get_prog",
+        "get_node_prog",
+        {"device_id": "test_device", "node": _HTR_NODE},
+    ),
+    (
+        "set_mode",
+        "set_node_mode",
+        {
+            "device_id": "test_device",
+            "node": _HTR_NODE,
+            "mode_args": {"mode": "auto"},
+        },
+    ),
+    (
+        "set_lock",
+        "set_node_lock",
+        {
+            "device_id": "test_device",
+            "node": _HTR_NODE,
+            "lock_args": {"locked": False},
+        },
+    ),
+    (
+        "set_boost",
+        "set_node_boost",
+        {
+            "device_id": "test_device",
+            "node": _HTR_NODE,
+            "boost_args": {"boost": False},
+        },
+    ),
+    (
+        "set_prog_temps",
+        "set_node_prog_temps",
+        {
+            "device_id": "test_device",
+            "node": _HTR_NODE,
+            "temps_args": {"temp": 20},
+        },
+    ),
+    (
+        "set_node_name",
+        "set_node_name",
+        {"device_id": "test_device", "node": _HTR_NODE, "name": "New"},
+    ),
+    (
+        "set_node_select",
+        "set_node_select",
+        {
+            "device_id": "test_device",
+            "node": _HTR_NODE,
+            "select_args": {"select": True},
+        },
+    ),
+    (
+        "get_node_power",
+        "get_node_power",
+        {"device_id": "test_device", "node": _HTR_NODE},
+    ),
+    (
+        "delete_node",
+        "delete_node",
+        {"device_id": "test_device", "node": _HTR_NODE, "purge": False},
+    ),
+    (
+        "get_device_discovery",
+        "get_device_discovery",
+        {"device_id": "test_device"},
+    ),
+    (
+        "set_device_discovery",
+        "set_device_discovery",
+        {"device_id": "test_device", "discovery_args": {"discovery": "on"}},
+    ),
+    (
+        "get_device_rtc_time",
+        "get_device_rtc_time",
+        {"device_id": "test_device"},
+    ),
+    (
+        "set_device_name",
+        "set_device_name",
+        {"device_id": "test_device", "name": "New"},
+    ),
+    ("delete_device", "delete_device", {"device_id": "test_device"}),
+    (
+        "move_device_to_group",
+        "move_device_to_group",
+        {"device_id": "test_device", "group_args": {"groupid": "home1"}},
+    ),
+    ("get_group_geo_data", "get_group_geo_data", {"group_id": "home1"}),
+    ("set_group_name", "set_group_name", {"group_id": "home1", "name": "New"}),
+    ("get_group_extra_data", "get_group_extra_data", {"group_id": "home1"}),
+    ("get_home_guests", "get_home_guests", {"home_id": "home1"}),
+    (
+        "invite_user",
+        "invite_user",
+        {
+            "user_id": "u1",
+            "home_id": "home1",
+            "email": "a@b.c",
+            "confirmation_url": "https://x/invite-confirm/nserie17",
+        },
+    ),
+    (
+        "revoke_invite",
+        "revoke_invite",
+        {"user_id": "u1", "home_id": "home1", "email": "a@b.c"},
+    ),
+    (
+        "confirm_invite",
+        "confirm_invite",
+        {"user_id": "u1", "password": "pw", "code": "c"},
+    ),
+    (
+        "get_quiet_home_notifications",
+        "get_quiet_home_notifications",
+        {"group_id": "home1"},
+    ),
+    (
+        "set_quiet_home_notifications",
+        "set_quiet_home_notifications",
+        {"group_id": "home1", "notification_data": {"enabled": True}},
+    ),
+    (
+        "test_quiet_home_notifications",
+        "test_quiet_home_notifications",
+        {"group_id": "home1"},
+    ),
+    (
+        "get_encrypted_wifi_credentials",
+        "get_encrypted_wifi_credentials",
+        {"ssid": "s", "wifi_password": "p"},
+    ),
+    (
+        "get_coordinates",
+        "get_coordinates",
+        {"country": "c", "state": "st", "city": "ci", "zip_code": "z"},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("method", "async_method", "kwargs"), _SYNC_MANAGEMENT_WRAPPERS
+)
+def test_sync_management_wrapper_passes_through(
+    session, method, async_method, kwargs
+):
+    with patch.object(
+        session._async,
+        async_method,
+        new_callable=AsyncMock,
+    ) as mock_async:
+        mock_async.return_value = {}
+        result = getattr(session, method)(**kwargs)
+        assert result == {}
+        mock_async.assert_awaited_once_with(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_api_delete_sends_delete_method(async_session):
+    with patch.object(
+        async_session,
+        "_request",
+        new_callable=AsyncMock,
+    ) as mock_request:
+        mock_request.return_value = {}
+        result = await async_session._api_delete(
+            "devs/test_device",
+            data={"purge": False},
+        )
+    assert result == {}
+    mock_request.assert_awaited_once_with(
+        "delete",
+        f"{async_session._api_host}/api/v2/devs/test_device",
+        data={"purge": False},
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_device_power_limit_non_pmo_node(async_smartbox_session):
+    """A non-pmo node reads the device-wide htr_system power_limit."""
+    node = {"name": "Living Room", "addr": 5, "type": "htr", "installed": True}
+    with patch.object(
+        async_smartbox_session,
+        "_api_request",
+        new_callable=AsyncMock,
+    ) as mock_api_request:
+        mock_api_request.return_value = {"power_limit": "100"}
+        result = await async_smartbox_session.get_device_power_limit(
+            device_id="test_device",
+            node=node,
+        )
+        assert result == 100
+        mock_api_request.assert_called_once_with(
+            "devs/test_device/htr_system/power_limit",
+        )
+
+
+@pytest.mark.asyncio
+async def test_get_device_power_limit_malformed_response(
+    async_smartbox_session,
+):
+    """A payload without the expected key raises SmartboxError."""
+    with patch.object(
+        async_smartbox_session,
+        "_api_request",
+        new_callable=AsyncMock,
+    ) as mock_api_request:
+        mock_api_request.return_value = {"unexpected": "shape"}
+        with pytest.raises(
+            SmartboxError,
+            match="Unexpected power-limit response",
+        ):
+            await async_smartbox_session.get_device_power_limit(
+                device_id="test_device",
+            )
+
+
+@pytest.mark.asyncio
+async def test_set_node_prog_merges_with_typed_prog(async_smartbox_session):
+    """Merge the current prog when it comes back as a model (typed mode)."""
+    raw_prog = json.loads(
+        (
+            Path(__file__).parent / "fixtures/live/htr_prog_addr5.json"
+        ).read_text()
+    )
+    with (
+        patch.object(
+            async_smartbox_session,
+            "_api_request",
+            new_callable=AsyncMock,
+        ) as mock_api_request,
+        patch.object(
+            async_smartbox_session,
+            "_api_post",
+            new_callable=AsyncMock,
+        ) as mock_api_post,
+    ):
+        mock_api_request.return_value = raw_prog
+        mock_api_post.return_value = None
+        async_smartbox_session.raw_response = False
+        try:
+            await async_smartbox_session.set_node_prog(
+                "test_device",
+                _HTR_NODE,
+                {"prog": {"0": [2] * 24}},
+            )
+        finally:
+            async_smartbox_session.raw_response = True
+    mock_api_post.assert_called_once_with(
+        data={"prog": {**raw_prog["prog"], "0": [2] * 24}},
+        path="devs/test_device/htr/5/prog",
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_group_name(async_smartbox_session):
+    with patch.object(
+        async_smartbox_session,
+        "_api_post",
+        new_callable=AsyncMock,
+    ) as mock_api_post:
+        mock_api_post.return_value = None
+        result = await async_smartbox_session.set_group_name(
+            "home1",
+            "New name",
+        )
+        assert result is None
+        mock_api_post.assert_called_once_with(
+            data={"name": "New name"},
+            path="groups/home1/name",
+        )
+
+
+@pytest.mark.asyncio
+async def test_call_budget_reraises_foreign_timeout():
+    """A TimeoutError raised by the enclosed work must not be converted."""
+    with pytest.raises(TimeoutError, match="inner work timeout"):
+        async with _call_budget():
+            foreign_timeout = TimeoutError("inner work timeout")
+            raise foreign_timeout
