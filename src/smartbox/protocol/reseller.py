@@ -1,22 +1,44 @@
-"""Reseller of Smartbox."""
+"""Reseller table: the vendor's per-reseller API endpoints.
 
+The values are pinned by ``tests/test_lib_contract.py``. The model is a
+frozen dataclass rather than a validating one: callers only read fields,
+so construction cannot fail and there is no validation-error path to
+handle.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 import logging
 from typing import ClassVar
 
-from pydantic import BaseModel, ValidationError
+from .errors import ResellerNotExistError
 
-from smartbox.error import ResellerNotExistError
-
-SMARTBOX_GENERIC_BASIC_AUTH = "NTRiY2NiZmI0MWE5YTUxMTNmMDQ4OGQwOnZkaXZkaQ=="
 _LOGGER = logging.getLogger(__name__)
 
+SMARTBOX_GENERIC_BASIC_AUTH = "NTRiY2NiZmI0MWE5YTUxMTNmMDQ4OGQwOnZkaXZkaQ=="
 
-class SmartboxReseller(BaseModel):
-    """Model of Smartbox Reseller config."""
+# The API host the CURRENT vendor apps dial: every decoded bundle (the four
+# brand web apps, the smartcontrol web app and mobile 2.40.4) is built against
+# it (docs/api-ws-user.md §1.1); the per-reseller hosts are superseded on the
+# wire. A reseller row's ``api_url`` is the BRAND KEY, not a host: it selects
+# the Basic credential, the serial id and the ``x-referer``, and it keys the
+# config entry's unique id.
+API_HOST = "users-api.helki.com"
+
+
+def api_base_url() -> str:
+    """Return the base URL every client dials (REST and the ws_user socket)."""
+    return f"https://{API_HOST}"
+
+
+@dataclass(frozen=True)
+class SmartboxReseller:
+    """Model of a Smartbox reseller config."""
 
     name: str = "Smartbox"
     web_url: str = ""
-    api_url: str
+    api_url: str = ""
     basic_auth: str = SMARTBOX_GENERIC_BASIC_AUTH
     serial_id: int = 0
 
@@ -86,6 +108,15 @@ class AvailableResellers:
             basic_auth="NTU2ZDc0MWI3OGUzYmU5YjU2NjA3NTQ4OnZkaXZkaQ==",
             serial_id=14,
         ),
+        # Tenant constants decoded from the vendor's Tevolve web bundle
+        # (tevolve.termoweb.net, 2026-10-20); live login not yet exercised.
+        "api-tevolve": SmartboxReseller(
+            name="Tevolve",
+            web_url="https://tevolve.termoweb.net/",
+            api_url="api-tevolve",
+            basic_auth="NWM0OWRjZTk3NzUxMDM1MTUwNmM0MmRiOnRldm9sdmU=",
+            serial_id=15,
+        ),
         "api-technoterm": SmartboxReseller(
             name="Technotherm",
             web_url="https://ttiapp.technotherm.com/",
@@ -127,25 +158,22 @@ class AvailableResellers:
             ):
                 msg = f"This reseller {self._api_url} is not yet available or some arguments are missing."
                 raise ResellerNotExistError(msg)
-            try:
-                # Note: never log basic_auth — callers may supply their own
-                # credential for unknown resellers.
-                _LOGGER.debug(
-                    "Creating a new reseller api_url (%s), name=%s, web_url %s, serial_id=%s",
-                    self._api_url,
-                    self._name,
-                    self._web_url,
-                    self._serial_id,
-                )
-                reseller = SmartboxReseller(
-                    api_url=self._api_url,
-                    basic_auth=self._basic_auth,
-                    web_url=self._web_url,
-                    serial_id=self._serial_id,
-                    name=self._name,
-                )
-            except ValidationError as e:
-                raise ResellerNotExistError from e
+            # Note: never log basic_auth — callers may supply their own
+            # credential for unknown resellers.
+            _LOGGER.debug(
+                "Creating a new reseller api_url (%s), name=%s, web_url %s, serial_id=%s",
+                self._api_url,
+                self._name,
+                self._web_url,
+                self._serial_id,
+            )
+            reseller = SmartboxReseller(
+                api_url=self._api_url,
+                basic_auth=self._basic_auth,
+                web_url=self._web_url,
+                serial_id=self._serial_id,
+                name=self._name,
+            )
         _LOGGER.debug(
             "Reseller api_url (%s), name=%s,  web_url %s",
             reseller.api_url,

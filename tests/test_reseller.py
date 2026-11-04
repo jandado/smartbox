@@ -1,65 +1,40 @@
+"""Tests for the reseller table and convenience accessors."""
+
+from __future__ import annotations
+
 import pytest
 
-from smartbox import AsyncSmartboxSession, ResellerNotExistError
-from smartbox.reseller import AvailableResellers
+from smartbox.protocol.errors import ResellerNotExistError
+from smartbox.protocol.reseller import API_HOST, AvailableResellers, api_base_url
 
 
-def test_available_resellers_existing_reseller():
-    reseller = AvailableResellers(api_url="api").reseller
-    assert reseller.name == "Helki"
+def test_api_base_url_uses_the_current_host():
+    assert API_HOST == "users-api.helki.com"
+    assert api_base_url() == f"https://{API_HOST}"
+
+
+def test_known_reseller():
+    reseller = AvailableResellers("api")
+    assert reseller.reseller.name == "Helki"
     assert reseller.api_url == "api"
+    assert reseller.name == "Helki"
+    assert reseller.web_url == "https://app.helki.com/"
 
 
-def test_available_resellers_non_existing_reseller():
+def test_unknown_reseller_needs_all_fields():
     with pytest.raises(ResellerNotExistError):
-        AvailableResellers(api_url="non-existing-api").reseller
+        _ = AvailableResellers("api-unknown").reseller
 
 
-def test_available_resellers_custom_reseller():
-    serial_id = 99
-    _reseller = AvailableResellers(
-        api_url="custom-api",
-        basic_auth="custom-auth",
-        web_url="https://custom-url.com",
-        serial_id=serial_id,
-        name="Custom",
-    )
-    reseller = _reseller.reseller
-    assert reseller.name == "Custom"
-    assert reseller.api_url == "custom-api"
-    assert reseller.basic_auth == "custom-auth"
-    assert reseller.web_url == "https://custom-url.com"
-    assert reseller.serial_id == serial_id
-
-    assert _reseller.name == "Custom"
-    assert _reseller.api_url == "custom-api"
-    assert _reseller.web_url == "https://custom-url.com"
-
-
-def test_reseller_invalid_data():
-    with pytest.raises(ResellerNotExistError):
-        AvailableResellers(
-            api_url="invalid-api",
-            basic_auth="invalid-auth",
-            web_url="invalid-url",
-            serial_id="invalid-serial-id",
-        ).reseller
-
-
-@pytest.mark.network
-@pytest.mark.asyncio
-async def test_all_resellers():
-    """Hit every reseller's real API. Deselected by default (``-m network``).
-
-    Makes ~24 unmocked HTTP calls to third-party reseller servers, so it
-    must not run in the default suite: a reseller outage would fail CI
-    without any code change. Run it on demand with ``pytest -m network``.
-    """
-    for key in AvailableResellers.resellers:
-        async with AsyncSmartboxSession(
-            username="", password="", api_name=key
-        ) as _session:
-            check = await _session.health_check()
-            assert check is not None
-            version = await _session.api_version()
-            assert "major" in version
+def test_unknown_reseller_can_be_created():
+    reseller = AvailableResellers(
+        "api-unknown",
+        basic_auth="secret",
+        web_url="https://example.test/",
+        serial_id=99,
+        name="Example",
+    ).reseller
+    assert reseller.api_url == "api-unknown"
+    assert reseller.name == "Example"
+    assert reseller.web_url == "https://example.test/"
+    assert reseller.serial_id == 99
