@@ -1,5 +1,31 @@
 # Changelog
 
+## 3.0.0rc1
+
+Release candidate for the standalone protocol/core library used by the 3.0
+Home Assistant integration.
+
+### Breaking
+
+* The 2.7 session/update-manager API is replaced by `smartbox.protocol`
+  (`SmartboxClient`, auth, `ws_user` transport, named writes) and
+  `smartbox.core` (`SmartboxEngine`, state, deadlines, feed).
+* The library is Home Assistant-free by construction; the integration depends
+  on it instead of vendoring the layers.
+* The CLI now uses the new client and `ws_user` transport. The old per-device
+  `socket` command is replaced by `listen`; `set-setup` exposes the granular
+  setup writes; boost and node power-limit commands are added.
+
+### New
+
+* The CLI remains available as the optional `cli` extra:
+  `pip install "smartbox[cli] ..."`.
+* `SmartboxClient.get_home_guests()` and the CLI `guests` command.
+* `WriteApi.set_setup_value()` as the CLI/debug escape hatch for setup keys
+  without a named setter.
+
+See GitHub release notes: https://github.com/jandado/smartbox/releases
+
 ## 2.7.0
 
 ### New
