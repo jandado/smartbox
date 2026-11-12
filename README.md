@@ -5,7 +5,7 @@ Haverland, Climastar, Technotherm, HJM, …).
 
 This is the 3.0 rewrite. It exposes the protocol and domain layers that the
 Home Assistant integration uses, without importing Home Assistant. The 2.7
-API remains available on the `main` branch and the `v2.7.0` tag.
+API remains available on the `v2.7.0` tag.
 
 ## Install
 
