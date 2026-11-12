@@ -1,4 +1,4 @@
-# smartbox 3.0 (release candidate)
+# smartbox 3.0
 
 Python library for Smartbox heating systems (Helki and its resellers: Elnur,
 Haverland, Climastar, Technotherm, HJM, …).
@@ -12,13 +12,13 @@ API remains available on the `main` branch and the `v2.7.0` tag.
 From the tagged source:
 
 ```sh
-pip install "smartbox @ https://github.com/jandado/smartbox/archive/refs/tags/v3.0.0-rc.1.tar.gz"
+pip install "smartbox @ https://github.com/jandado/smartbox/archive/refs/tags/v3.0.0.tar.gz"
 ```
 
 With the optional command line tool:
 
 ```sh
-pip install "smartbox[cli] @ https://github.com/jandado/smartbox/archive/refs/tags/v3.0.0-rc.1.tar.gz"
+pip install "smartbox[cli] @ https://github.com/jandado/smartbox/archive/refs/tags/v3.0.0.tar.gz"
 ```
 
 For development:

@@ -1,8 +1,8 @@
 # Changelog
 
-## 3.0.0rc1
+## 3.0.0
 
-Release candidate for the standalone protocol/core library used by the 3.0
+First stable release of the standalone protocol/core library used by the 3.x
 Home Assistant integration.
 
 ### Breaking
